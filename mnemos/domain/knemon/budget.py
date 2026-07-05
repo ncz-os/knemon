@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -30,6 +31,16 @@ class BudgetDecision:
     @property
     def allowed(self) -> bool:
         return self.verdict is BudgetVerdict.ALLOW
+
+
+def _normalise_estimated_cost(value: Any) -> tuple[float, bool]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0, False
+    if not math.isfinite(parsed) or parsed < 0:
+        return 0.0, False
+    return parsed, True
 
 
 async def weekly_spend_usd(
@@ -145,6 +156,8 @@ async def evaluate_usage_budget(
     than granting unlimited spend. Deployments that do not want enforcement leave
     the caps unset (the unlimited ALLOW path below).
     """
+    estimated_cost_usd, estimate_valid = _normalise_estimated_cost(estimated_cost_usd)
+
     if limit_usd is None:
         configured = float(get_settings().knemon.weekly_budget_cap_usd)
         limit_usd = configured if configured > 0 else None
@@ -160,6 +173,14 @@ async def evaluate_usage_budget(
 
     if limit_usd is None and provider_cap is None:
         return BudgetDecision(BudgetVerdict.ALLOW, float("inf"), "no limit", limit_usd=None)
+
+    if not estimate_valid:
+        return BudgetDecision(
+            BudgetVerdict.DENY,
+            0.0,
+            "invalid estimated cost; failing closed under configured cap",
+            limit_usd=limit_usd if limit_usd is not None else provider_cap,
+        )
 
     # Any configured cap requires a working ledger; otherwise fail closed.
     if backend is None:

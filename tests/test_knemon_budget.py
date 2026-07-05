@@ -84,6 +84,22 @@ async def test_estimated_cost_over_provider_cap_denies(patch_settings, monkeypat
     assert "would exceed provider:openai remaining" in decision.reason
 
 
+@pytest.mark.parametrize("estimated_cost", [-1.0, float("nan"), float("inf"), "not-a-number"])
+@pytest.mark.asyncio
+async def test_invalid_estimated_cost_fails_closed_under_configured_cap(
+    patch_settings,
+    monkeypatch,
+    estimated_cost,
+):
+    patch_settings(weekly=100.0)
+    _patch_spends(monkeypatch, total=10.0)
+
+    decision = await evaluate_usage_budget(object(), estimated_cost_usd=estimated_cost)
+
+    assert not decision.allowed
+    assert "invalid estimated cost" in decision.reason
+
+
 @pytest.mark.asyncio
 async def test_fail_closed_when_backend_missing_under_provider_cap(patch_settings):
     patch_settings(weekly=0.0, provider_caps={"openai": 50.0})

@@ -707,18 +707,20 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
     if not candidates:
         raise NoModelAvailable("no model satisfies required capabilities, provider exclusions, and context window")
 
+    rec_policy = recommendation_policy(req.task_kind)
     session_burned = await _session_burned(backend, req.caller_session_id)
     effective_priority = _downgrade_priority(req.priority) if session_burned else req.priority
-    candidates = _apply_priority_ceiling(candidates, effective_priority, requested_priority=req.priority)
-    if not candidates:
-        raise NoModelAvailable("no model satisfies priority tier and quality constraints")
+    priority_exempt_task = rec_policy.task_type in {"embedding", "routing"}
+    if not priority_exempt_task:
+        candidates = _apply_priority_ceiling(candidates, effective_priority, requested_priority=req.priority)
+        if not candidates:
+            raise NoModelAvailable("no model satisfies priority tier and quality constraints")
 
     # ── Task-type capability filter (recommendation policy) ──────────────────
     # Narrow candidates by the task_kind's required/any/excluded capabilities,
     # strip special-purpose models, apply tier preferences, and rank by
     # preferred models so that code-fix routes to a coder, narrative to a chat
     # model, embedding to an embedding model, routing to a small/fast model, etc.
-    rec_policy = recommendation_policy(req.task_kind)
     # Canonicalise policy caps through the same alias table used for model
     # caps so that "code"→"coding" and CSVs match (router side of the
     # _caps_match fix in recommendation.py).
@@ -756,6 +758,8 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
             )
         )
         candidates = _task_filtered
+    elif _task_required_caps or _task_any_caps:
+        raise NoModelAvailable("no model satisfies task-type capability requirements")
     if not candidates:
         raise NoModelAvailable("no model satisfies task-type capability requirements")
 
