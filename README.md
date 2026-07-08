@@ -36,3 +36,19 @@ KNEMON depends on `mnemos-core` (one direction only). It pairs naturally with
 `mnemos-pantheon` (the LLM facade KNEMON routes across) and `mnemos-graeae` (the
 reasoning bus whose consultations KNEMON budgets), but does not require them —
 each layer is independently installable.
+
+
+## Build infrastructure & partners
+
+Continuous integration and package distribution for this project are generously
+supported by our open-source infrastructure partners:
+
+- **[GitLab](https://gitlab.com/)** — canonical source hosting and CI pipelines
+  (format / lint / test gates), via the
+  [GitLab for Open Source](https://about.gitlab.com/solutions/open-source/) program.
+- **[Buildkite](https://buildkite.com/)** — CI/CD orchestration with hosted macOS
+  and Linux agents, and our APT package registry host
+  (`packages.buildkite.com/ncz-os/ncz`), via the
+  [Buildkite Open Source](https://buildkite.com/pricing) program.
+
+Thank you to both for backing open-source software.
