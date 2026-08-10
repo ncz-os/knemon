@@ -4,6 +4,7 @@ import sys
 import sqlite3
 from contextlib import asynccontextmanager
 from decimal import Decimal
+from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -598,10 +599,10 @@ def test_burn_reservation_migrations_cover_all_supported_backends():
 
 
 def test_usage_ledger_migrations_preserve_constraint_parity():
-    root = Path(__file__).resolve().parent.parent
-    pg = (root / "db/migrations/0032_usage_ledger.sql").read_text()
-    oracle = (root / "db/migrations_oracle/0032_usage_ledger.sql").read_text()
-    db2 = (root / "db/migrations_db2/0032_usage_ledger.sql").read_text()
+    migrations = files("mnemos.db_migrations")
+    pg = (migrations / "migrations/0032_usage_ledger.sql").read_text()
+    oracle = (migrations / "migrations_oracle/0032_usage_ledger.sql").read_text()
+    db2 = (migrations / "migrations_db2/0032_usage_ledger.sql").read_text()
 
     for sql in (pg, oracle, db2):
         normalized = " ".join(sql.lower().split())
@@ -611,6 +612,6 @@ def test_usage_ledger_migrations_preserve_constraint_parity():
         assert "check (latency_ms >= 0)" in normalized
 
 
-def test_plan_window_hints_exclude_deleted_claude_future_rows():
-    assert ("anthropic", "claude_max_interactive_post_jun15") not in _PLAN_WINDOWS
-    assert ("anthropic", "agent_sdk_credit_pool_post_jun15") not in _PLAN_WINDOWS
+def test_plan_window_hints_preserve_expired_claude_rows_for_historical_ledgers():
+    assert _PLAN_WINDOWS[("anthropic", "claude_max_interactive_post_jun15")] == ("rolling", 18000)
+    assert _PLAN_WINDOWS[("anthropic", "agent_sdk_credit_pool_post_jun15")] == ("monthly", None)

@@ -1,0 +1,2 @@
+mnemos-core
+fastapi

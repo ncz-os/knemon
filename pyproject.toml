@@ -12,3 +12,9 @@ dependencies = ["mnemos-core", "fastapi"]
 [tool.setuptools.packages.find]
 include = ["mnemos*"]
 namespaces = true
+
+[tool.pytest.ini_options]
+# The fleet review checkout keeps optional namespace overlays as siblings. Add
+# PANTHEON for the explicit KNEMON/PANTHEON integration tests without making it
+# a runtime dependency of the independently installable KNEMON package.
+pythonpath = ["../pantheon"]

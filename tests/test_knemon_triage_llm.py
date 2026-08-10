@@ -188,6 +188,8 @@ class _FailingLedgerBackend(_LedgerBackend):
 @pytest.mark.asyncio
 async def test_llm_wrapper_records_in_finally_on_exception(monkeypatch):
     import mnemos.llm as llm
+    from mnemos.domain.graeae import engine
+    from mnemos.domain.pantheon import triage
 
     backend = _LedgerBackend()
     monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
@@ -195,8 +197,9 @@ async def test_llm_wrapper_records_in_finally_on_exception(monkeypatch):
     async def fake_recommend(*args, **kwargs):
         return {"id": "gpt-test", "provider": "openai"}
 
-    monkeypatch.setattr(llm.triage, "recommend", fake_recommend)
-    monkeypatch.setattr(llm, "get_graeae_engine", lambda: _FailingEngine())
+    monkeypatch.setattr(llm, "is_extra_installed", lambda _extra: True)
+    monkeypatch.setattr(triage, "recommend", fake_recommend)
+    monkeypatch.setattr(engine, "get_graeae_engine", lambda: _FailingEngine())
 
     with pytest.raises(RuntimeError, match="provider exploded"):
         await llm.call(
@@ -229,6 +232,8 @@ async def test_llm_wrapper_records_in_finally_on_exception(monkeypatch):
 @pytest.mark.asyncio
 async def test_llm_wrapper_marks_result_degraded_on_ledger_failure(monkeypatch, caplog):
     import mnemos.llm as llm
+    from mnemos.domain.graeae import engine
+    from mnemos.domain.pantheon import triage
 
     backend = _FailingLedgerBackend()
     monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
@@ -236,8 +241,9 @@ async def test_llm_wrapper_marks_result_degraded_on_ledger_failure(monkeypatch, 
     async def fake_recommend(*args, **kwargs):
         return {"id": "gpt-test", "provider": "openai"}
 
-    monkeypatch.setattr(llm.triage, "recommend", fake_recommend)
-    monkeypatch.setattr(llm, "get_graeae_engine", lambda: _SuccessEngine())
+    monkeypatch.setattr(llm, "is_extra_installed", lambda _extra: True)
+    monkeypatch.setattr(triage, "recommend", fake_recommend)
+    monkeypatch.setattr(engine, "get_graeae_engine", lambda: _SuccessEngine())
 
     with caplog.at_level("ERROR"):
         result = await llm.call(
@@ -263,6 +269,8 @@ async def test_llm_wrapper_marks_result_degraded_on_ledger_failure(monkeypatch, 
 @pytest.mark.asyncio
 async def test_llm_wrapper_marks_result_ok_on_successful_ledger_record(monkeypatch):
     import mnemos.llm as llm
+    from mnemos.domain.graeae import engine
+    from mnemos.domain.pantheon import triage
 
     backend = _LedgerBackend()
     monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
@@ -270,8 +278,9 @@ async def test_llm_wrapper_marks_result_ok_on_successful_ledger_record(monkeypat
     async def fake_recommend(*args, **kwargs):
         return {"id": "gpt-test", "provider": "openai"}
 
-    monkeypatch.setattr(llm.triage, "recommend", fake_recommend)
-    monkeypatch.setattr(llm, "get_graeae_engine", lambda: _SuccessEngine())
+    monkeypatch.setattr(llm, "is_extra_installed", lambda _extra: True)
+    monkeypatch.setattr(triage, "recommend", fake_recommend)
+    monkeypatch.setattr(engine, "get_graeae_engine", lambda: _SuccessEngine())
 
     result = await llm.call(
         llm.Task(

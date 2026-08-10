@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from importlib.resources import files
+from importlib.resources.abc import Traversable
 
 import pytest
 
 
-ROOT = Path(__file__).resolve().parent.parent
+MIGRATION_ROOT = files("mnemos.db_migrations")
 
 MIGRATIONS = [
-    ROOT / "db/migrations/0039_knemon_dispatch_rule_refresh.sql",
-    ROOT / "db/migrations_oracle/0039_knemon_dispatch_rule_refresh.sql",
-    ROOT / "db/migrations_db2/0039_knemon_dispatch_rule_refresh.sql",
+    MIGRATION_ROOT / "migrations/0039_knemon_dispatch_rule_refresh.sql",
+    MIGRATION_ROOT / "migrations_oracle/0039_knemon_dispatch_rule_refresh.sql",
+    MIGRATION_ROOT / "migrations_db2/0039_knemon_dispatch_rule_refresh.sql",
 ]
 
 EXPECTED_PLAN_NAMES = {
@@ -57,7 +58,7 @@ def _row_window(sql: str, plan_name: str) -> str:
 
 
 @pytest.mark.parametrize("migration", MIGRATIONS, ids=lambda path: path.parent.name)
-def test_knemon_0039_plan_names_match_across_backends(migration: Path) -> None:
+def test_knemon_0039_plan_names_match_across_backends(migration: Traversable) -> None:
     sql = migration.read_text(encoding="utf-8")
 
     assert {plan for plan in EXPECTED_PLAN_NAMES if f"'{plan}'" in sql} == EXPECTED_PLAN_NAMES
@@ -66,7 +67,7 @@ def test_knemon_0039_plan_names_match_across_backends(migration: Path) -> None:
 @pytest.mark.parametrize("migration", MIGRATIONS, ids=lambda path: path.parent.name)
 @pytest.mark.parametrize("plan_name, markers", EXPECTED_ROW_MARKERS.items())
 def test_knemon_0039_plan_row_markers_match_current_audit(
-    migration: Path,
+    migration: Traversable,
     plan_name: str,
     markers: tuple[str, ...],
 ) -> None:
@@ -79,7 +80,7 @@ def test_knemon_0039_plan_row_markers_match_current_audit(
 @pytest.mark.parametrize("migration", MIGRATIONS, ids=lambda path: path.parent.name)
 @pytest.mark.parametrize("plan_name, parent_plan", EXPECTED_CODEX_PRO_PARENTS.items())
 def test_knemon_0039_codex_pro_rows_use_stable_parent_aliases(
-    migration: Path,
+    migration: Traversable,
     plan_name: str,
     parent_plan: str,
 ) -> None:
@@ -90,7 +91,7 @@ def test_knemon_0039_codex_pro_rows_use_stable_parent_aliases(
 
 
 @pytest.mark.parametrize("migration", MIGRATIONS, ids=lambda path: path.parent.name)
-def test_knemon_0039_backfills_legacy_subscription_path_kind(migration: Path) -> None:
+def test_knemon_0039_backfills_legacy_subscription_path_kind(migration: Traversable) -> None:
     sql = migration.read_text(encoding="utf-8")
 
     assert "UPDATE usage_ledger" in sql
