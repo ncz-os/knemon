@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import pytest
 
 from mnemos.api.routes import knemon_dashboard, knemon_utilization
+from mnemos.domain.knemon.router import _qmark_sql
 
 
 class _AsyncpgConnection:
@@ -35,3 +36,13 @@ async def test_endpoint_rows_support_asyncpg_connections(monkeypatch, module):
 
     assert rows == [{"value": 7}]
     assert backend.conn.calls == [("SELECT $1 AS value", (7,))]
+
+
+def test_db2_native_named_parameters_convert_to_qmark_positional():
+    sql, params = _qmark_sql(
+        "SELECT :session_id FROM knemon_burn_sessions WHERE session_id = :session_id",
+        {"session_id": "worker-1"},
+    )
+
+    assert sql == "SELECT ? FROM knemon_burn_sessions WHERE session_id = ?"
+    assert params == ["worker-1", "worker-1"]

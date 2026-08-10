@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
+import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -76,10 +79,32 @@ class KnemonRouteDecision:
     dispatch_required_capabilities: list[str] = field(default_factory=list)
     dispatch_cost_tier: str = ""
     dispatch_subscription_pools: list[str] = field(default_factory=list)
+    # Durable burn-accounting reservation. Callers should return this token on
+    # the corresponding /v1/ledger write. Optional fields preserve the public
+    # response contract for clients that have not adopted reservations yet.
+    reservation_id: str | None = None
+    reservation_expires_at: str | None = None
 
 
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
 _NAMED_PARAM_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+logger = logging.getLogger(__name__)
+
+
+class BurnReservationSchemaMissing(RuntimeError):
+    """Raised when atomic burn accounting has not been migrated."""
+
+
+class BurnReservationConflict(RuntimeError):
+    """Raised when a ledger write cannot reconcile its reservation token."""
+
+
+@dataclass(frozen=True)
+class _BurnReservation:
+    reservation_id: str | None
+    expires_at: datetime | None
+    burned: bool
 
 # Caller-subsystem -> dispatchable provider allowlist (GRAEAE consult de8f4b2b 2026-05-28:
 # Option A centralized allowlist, config-driven/version-controlled, NoModelAvailable -> caller blocks).
@@ -175,6 +200,19 @@ def _mysql_sql(sql: str, params: dict[str, Any]) -> tuple[str, list[Any]]:
     return _NAMED_PARAM_RE.sub(replace, sql), values
 
 
+def _qmark_sql(sql: str, params: dict[str, Any]) -> tuple[str, list[Any]]:
+    values: list[Any] = []
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in params:
+            return match.group(0)
+        values.append(params[name])
+        return "?"
+
+    return _NAMED_PARAM_RE.sub(replace, sql), values
+
+
 def _is_mysql_connection(conn: Any) -> bool:
     identity = f"{type(conn).__module__}.{type(conn).__name__}".lower()
     return any(marker in identity for marker in ("mysql", "mariadb", "aiomysql", "asyncmy"))
@@ -217,6 +255,337 @@ async def _rows(backend: Any, sql: str, params: dict[str, Any] | None = None) ->
             close = getattr(cursor, "close", None)
             if close is not None:
                 await _call(close)
+
+
+def _connection_dialect(conn: Any) -> str:
+    identity = f"{type(conn).__module__}.{type(conn).__name__}".lower()
+    if callable(getattr(conn, "fetch", None)):
+        return "postgres"
+    if _is_mysql_connection(conn):
+        return "mysql"
+    if "sqlite" in identity:
+        return "sqlite"
+    if any(marker in identity for marker in ("db2", "ibm_db")):
+        return "db2"
+    if any(marker in identity for marker in ("oracle", "oracledb", "cx_oracle")):
+        return "oracle"
+    return "named"
+
+
+async def _tx_execute(conn: Any, sql: str, params: dict[str, Any] | None = None) -> Any:
+    """Execute named-bind SQL on an already-open backend transaction."""
+    values = params or {}
+    execute = getattr(conn, "execute", None)
+    if callable(getattr(conn, "fetch", None)) and callable(execute):
+        pg_sql, pg_params = _asyncpg_sql(sql, values)
+        return await _call(execute, pg_sql, *pg_params)
+
+    cursor = await _call(conn.cursor)
+    try:
+        dialect = _connection_dialect(conn)
+        if dialect == "mysql":
+            mysql_sql, mysql_params = _mysql_sql(sql, values)
+            await _call(cursor.execute, mysql_sql, tuple(mysql_params))
+        elif dialect == "db2":
+            db2_sql, db2_params = _qmark_sql(sql, values)
+            await _call(cursor.execute, db2_sql, tuple(db2_params))
+        else:
+            await _call(cursor.execute, sql, values)
+        return getattr(cursor, "rowcount", None)
+    finally:
+        close = getattr(cursor, "close", None)
+        if close is not None:
+            await _call(close)
+
+
+async def _tx_rows(conn: Any, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Fetch rows without opening a second transaction."""
+    values = params or {}
+    fetch = getattr(conn, "fetch", None)
+    if callable(fetch):
+        pg_sql, pg_params = _asyncpg_sql(sql, values)
+        return _dict_rows(await _call(fetch, pg_sql, *pg_params))
+
+    cursor = await _call(conn.cursor)
+    try:
+        dialect = _connection_dialect(conn)
+        if dialect == "mysql":
+            mysql_sql, mysql_params = _mysql_sql(sql, values)
+            await _call(cursor.execute, mysql_sql, tuple(mysql_params))
+        elif dialect == "db2":
+            db2_sql, db2_params = _qmark_sql(sql, values)
+            await _call(cursor.execute, db2_sql, tuple(db2_params))
+        else:
+            await _call(cursor.execute, sql, values)
+        fetched = await _call(cursor.fetchall)
+        description = getattr(cursor, "description", None) or []
+        names = [str(col[0]).lower() for col in description]
+        return [dict(zip(names, row)) for row in fetched or []]
+    finally:
+        close = getattr(cursor, "close", None)
+        if close is not None:
+            await _call(close)
+
+
+def _allow_nonatomic_burn_development() -> bool:
+    return os.getenv("MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT", "").strip().lower() in _TRUE_VALUES
+
+
+def _reservation_ttl_seconds() -> int:
+    policy = get_settings().knemon
+    raw = os.getenv("MNEMOS_KNEMON_BURN_RESERVATION_TTL_SECONDS", "")
+    try:
+        configured = int(raw) if raw.strip() else int(policy.session_burn_window_seconds)
+    except (TypeError, ValueError):
+        configured = int(policy.session_burn_window_seconds)
+    return max(1, configured)
+
+
+def _is_burn_reservation_schema_missing(exc: Exception) -> bool:
+    sqlstate = str(getattr(exc, "sqlstate", "") or getattr(exc, "pgcode", ""))
+    errno = getattr(exc, "errno", None)
+    sqlcode = str(getattr(exc, "sqlcode", ""))
+    message = str(exc).lower()
+    table_named = "knemon_burn_sessions" in message or "knemon_burn_reservations" in message
+    return (
+        (sqlstate in {"42P01", "42704"} and table_named)
+        or (errno == 1146 and table_named)
+        or (sqlcode == "-204" and table_named)
+        or (
+            table_named
+            and any(
+                marker in message
+                for marker in ("no such table", "ora-00942", "does not exist", "sqlstate=42704", "sql0204n")
+            )
+        )
+    )
+
+
+def _is_unique_violation(exc: Exception) -> bool:
+    sqlstate = str(getattr(exc, "sqlstate", "") or getattr(exc, "pgcode", ""))
+    errno = getattr(exc, "errno", None)
+    code = getattr(exc, "code", None)
+    message = str(exc).lower()
+    return (
+        sqlstate == "23505"
+        or errno == 1062
+        or code == 1
+        or "ora-00001" in message
+        or "sql0803" in message
+    )
+
+
+async def _ensure_and_lock_burn_session(conn: Any, session_id: str, now: datetime) -> None:
+    dialect = _connection_dialect(conn)
+    params = {"session_id": session_id, "now_ts": now}
+    if dialect == "postgres":
+        insert_sql = """
+            INSERT INTO knemon_burn_sessions (session_id, touched_at)
+            VALUES (:session_id, :now_ts)
+            ON CONFLICT (session_id) DO NOTHING
+            """
+    elif dialect == "mysql":
+        insert_sql = """
+            INSERT INTO knemon_burn_sessions (session_id, touched_at)
+            VALUES (:session_id, :now_ts)
+            ON DUPLICATE KEY UPDATE touched_at = knemon_burn_sessions.touched_at
+            """
+    elif dialect == "sqlite":
+        insert_sql = """
+            INSERT INTO knemon_burn_sessions (session_id, touched_at)
+            VALUES (:session_id, :now_ts)
+            ON CONFLICT (session_id) DO NOTHING
+            """
+    elif dialect == "oracle":
+        insert_sql = """
+            MERGE INTO knemon_burn_sessions target
+            USING (SELECT :session_id AS session_id, :now_ts AS touched_at FROM dual) source
+            ON (target.session_id = source.session_id)
+            WHEN NOT MATCHED THEN
+              INSERT (session_id, touched_at) VALUES (source.session_id, source.touched_at)
+            """
+    elif dialect == "db2":
+        insert_sql = """
+            MERGE INTO knemon_burn_sessions AS target
+            USING (VALUES (:session_id, :now_ts)) AS source(session_id, touched_at)
+            ON target.session_id = source.session_id
+            WHEN NOT MATCHED THEN
+              INSERT (session_id, touched_at) VALUES (source.session_id, source.touched_at)
+            """
+    else:
+        insert_sql = """
+            INSERT INTO knemon_burn_sessions (session_id, touched_at)
+            VALUES (:session_id, :now_ts)
+            """
+    try:
+        await _tx_execute(conn, insert_sql, params)
+    except Exception as exc:
+        # Oracle and Db2 MERGE can lose a concurrent first-row race. Their
+        # drivers roll back the failed statement (not the transaction), so the
+        # loser can continue by locking the row inserted by the winner.
+        if dialect not in {"oracle", "db2"} or not _is_unique_violation(exc):
+            raise
+    lock_suffix = "" if dialect == "sqlite" else " FOR UPDATE"
+    await _tx_rows(
+        conn,
+        "SELECT session_id FROM knemon_burn_sessions WHERE session_id = :session_id" + lock_suffix,
+        {"session_id": session_id},
+    )
+    await _tx_execute(
+        conn,
+        "UPDATE knemon_burn_sessions SET touched_at = :now_ts WHERE session_id = :session_id",
+        params,
+    )
+
+
+async def _reserve_session_burn(backend: Any, session_id: str | None) -> _BurnReservation:
+    """Atomically check session burn and reserve this routed request."""
+    if not session_id:
+        return _BurnReservation(None, None, False)
+    policy = get_settings().knemon
+    threshold = int(policy.session_burn_requests_per_hour)
+    if threshold <= 0:
+        return _BurnReservation(None, None, False)
+    if _allow_nonatomic_burn_development():
+        return _BurnReservation(None, None, await _session_burned(backend, session_id))
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(seconds=int(policy.session_burn_window_seconds))
+    expires_at = now + timedelta(seconds=_reservation_ttl_seconds())
+    reservation_id = str(uuid.uuid4())
+    try:
+        async with backend.transactional() as tx:
+            conn = _conn_from_tx(tx)
+            await _ensure_and_lock_burn_session(conn, session_id, now)
+            ledger_rows = await _tx_rows(
+                conn,
+                """
+                SELECT COALESCE(SUM(request_count), 0) AS requests_used
+                FROM usage_ledger
+                WHERE session_id = :session_id AND ts >= :since_ts
+                """,
+                {"session_id": session_id, "since_ts": since},
+            )
+            reservation_rows = await _tx_rows(
+                conn,
+                """
+                SELECT COALESCE(SUM(request_count), 0) AS requests_reserved
+                FROM knemon_burn_reservations
+                WHERE session_id = :session_id
+                  AND status = 'pending'
+                  AND expires_at > :now_ts
+                """,
+                {"session_id": session_id, "now_ts": now},
+            )
+            used = _to_int((ledger_rows[0] if ledger_rows else {}).get("requests_used"))
+            reserved = _to_int((reservation_rows[0] if reservation_rows else {}).get("requests_reserved"))
+            await _tx_execute(
+                conn,
+                """
+                INSERT INTO knemon_burn_reservations (
+                  reservation_id, session_id, reserved_at, expires_at, request_count, status
+                ) VALUES (
+                  :reservation_id, :session_id, :reserved_at, :expires_at, 1, 'pending'
+                )
+                """,
+                {
+                    "reservation_id": reservation_id,
+                    "session_id": session_id,
+                    "reserved_at": now,
+                    "expires_at": expires_at,
+                },
+            )
+        return _BurnReservation(reservation_id, expires_at, used + reserved >= threshold)
+    except Exception as exc:
+        if not _is_burn_reservation_schema_missing(exc):
+            raise
+        if _allow_nonatomic_burn_development():
+            return _BurnReservation(None, None, await _session_burned(backend, session_id))
+        raise BurnReservationSchemaMissing(
+            "KNEMON atomic burn reservation schema is missing; apply migration "
+            "0040_knemon_burn_reservations and restart. For development or a single-worker "
+            "deployment only, set MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT=true "
+            "to use legacy non-atomic accounting."
+        ) from exc
+
+
+async def _release_burn_reservation(backend: Any, reservation_id: str | None) -> None:
+    if not reservation_id:
+        return
+    async with backend.transactional() as tx:
+        await _tx_execute(
+            _conn_from_tx(tx),
+            """
+            UPDATE knemon_burn_reservations
+            SET status = 'released', reconciled_at = :now_ts
+            WHERE reservation_id = :reservation_id AND status = 'pending'
+            """,
+            {"reservation_id": reservation_id, "now_ts": datetime.now(timezone.utc)},
+        )
+
+
+async def reconcile_burn_reservation(
+    tx: Any,
+    *,
+    reservation_id: str | None,
+    session_id: str,
+    ledger_id: int,
+    request_count: int = 1,
+) -> list[str]:
+    """Reconcile route reservations inside the ledger insert transaction.
+
+    An explicit token is strict. For backwards compatibility, callers without
+    a token reconcile the oldest pending reservations for the same session.
+    """
+    conn = _conn_from_tx(tx)
+    now = datetime.now(timezone.utc)
+    await _ensure_and_lock_burn_session(conn, session_id, now)
+    if reservation_id:
+        rows = await _tx_rows(
+            conn,
+            """
+            SELECT reservation_id, session_id, status
+            FROM knemon_burn_reservations
+            WHERE reservation_id = :reservation_id
+            """,
+            {"reservation_id": reservation_id},
+        )
+        row = rows[0] if rows else None
+        if row is None:
+            raise BurnReservationConflict(f"burn reservation {reservation_id} was not found")
+        if str(row.get("session_id")) != session_id:
+            raise BurnReservationConflict(
+                f"burn reservation {reservation_id} belongs to session {row.get('session_id')!r}, not {session_id!r}"
+            )
+        if str(row.get("status")) != "pending":
+            raise BurnReservationConflict(
+                f"burn reservation {reservation_id} is {row.get('status')!r}, expected 'pending'"
+            )
+        selected_ids = [reservation_id]
+    else:
+        rows = await _tx_rows(
+            conn,
+            """
+            SELECT reservation_id
+            FROM knemon_burn_reservations
+            WHERE session_id = :session_id AND status = 'pending'
+            ORDER BY reserved_at, reservation_id
+            """,
+            {"session_id": session_id},
+        )
+        selected_ids = [str(row["reservation_id"]) for row in rows[: max(0, int(request_count))]]
+
+    for selected_id in selected_ids:
+        await _tx_execute(
+            conn,
+            """
+            UPDATE knemon_burn_reservations
+            SET status = 'reconciled', reconciled_at = :now_ts, ledger_id = :ledger_id
+            WHERE reservation_id = :reservation_id AND status = 'pending'
+            """,
+            {"reservation_id": selected_id, "now_ts": now, "ledger_id": ledger_id},
+        )
+    return selected_ids
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -741,13 +1110,18 @@ def _fallback_chain(candidates: list[dict[str, Any]], selected: dict[str, Any]) 
     ]
 
 
-async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDecision:
+async def _route_locked(
+    req: KnemonRouteRequest,
+    backend: Any,
+    reservation: _BurnReservation | None = None,
+) -> KnemonRouteDecision:
     candidates = await _registry_candidates(req, backend)
     if not candidates:
         raise NoModelAvailable("no model satisfies required capabilities, provider exclusions, and context window")
 
     rec_policy = recommendation_policy(req.task_kind)
-    session_burned = await _session_burned(backend, req.caller_session_id)
+    reservation = reservation or await _reserve_session_burn(backend, req.caller_session_id)
+    session_burned = reservation.burned
     effective_priority = _downgrade_priority(req.priority) if session_burned else req.priority
     priority_exempt_task = rec_policy.task_type in {"embedding", "routing"}
     if not priority_exempt_task:
@@ -928,6 +1302,8 @@ async def _route_locked(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDec
             if selected.get("auth_method") == "subscription"
             else []
         ),
+        reservation_id=reservation.reservation_id,
+        reservation_expires_at=(reservation.expires_at.isoformat() if reservation.expires_at else None),
     )
 
 
@@ -936,5 +1312,13 @@ async def route(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDecision:
     if req.caller_session_id:
         lock = _SESSION_LOCKS.setdefault(req.caller_session_id, asyncio.Lock())
         async with lock:
-            return await _route_locked(req, backend)
+            reservation = await _reserve_session_burn(backend, req.caller_session_id)
+            try:
+                return await _route_locked(req, backend, reservation)
+            except BaseException:
+                try:
+                    await asyncio.shield(_release_burn_reservation(backend, reservation.reservation_id))
+                except Exception:
+                    logger.exception("failed to release KNEMON burn reservation after routing failure")
+                raise
     return await _route_locked(req, backend)

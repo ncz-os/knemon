@@ -37,6 +37,25 @@ KNEMON depends on `mnemos-core` (one direction only). It pairs naturally with
 reasoning bus whose consultations KNEMON budgets), but does not require them —
 each layer is independently installable.
 
+## Atomic session-burn accounting
+
+KNEMON routes reserve one request in the database before returning a decision.
+The route response includes `reservation_id` and `reservation_expires_at` as
+additive fields. Execution callers should pass `reservation_id` to the matching
+`POST /v1/ledger` request. That write records actual usage and marks the
+reservation reconciled in one transaction. Older callers that omit the token
+remain compatible: the ledger endpoint claims the oldest pending reservation
+for the same session. Abandoned reservations stop counting after
+`MNEMOS_KNEMON_BURN_RESERVATION_TTL_SECONDS`, which defaults to the configured
+session-burn window.
+
+Apply `0040_knemon_burn_reservations.sql` for the active database backend before
+deploying this release. Routing and ledger writes fail closed with an actionable
+error when the tables are absent. Development and single-worker deployments can
+temporarily opt into the legacy non-atomic behavior with
+`MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT=true`; this setting is not safe
+for production or multiple workers.
+
 
 ## Build infrastructure & partners
 

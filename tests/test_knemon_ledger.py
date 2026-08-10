@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
@@ -281,10 +282,35 @@ async def test_db2_record_usage_ledger_records_when_model_registry_missing(caplo
 class _EndpointBackend:
     def __init__(self) -> None:
         self.records: list[UsageLedgerRecord] = []
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(
+            """
+            CREATE TABLE knemon_burn_sessions (
+              session_id TEXT PRIMARY KEY,
+              touched_at TIMESTAMP NOT NULL
+            );
+            CREATE TABLE knemon_burn_reservations (
+              reservation_id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              reserved_at TIMESTAMP NOT NULL,
+              expires_at TIMESTAMP NOT NULL,
+              request_count INTEGER NOT NULL DEFAULT 1,
+              status TEXT NOT NULL,
+              reconciled_at TIMESTAMP,
+              ledger_id INTEGER
+            );
+            """
+        )
 
     @asynccontextmanager
     async def transactional(self):
-        yield object()
+        try:
+            yield self.conn
+        except BaseException:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
 
     async def record_usage_ledger(self, tx, record: UsageLedgerRecord) -> UsageLedgerResult:
         self.records.append(record)
@@ -472,6 +498,103 @@ async def test_ledger_endpoint_uses_active_plan_window_configuration(monkeypatch
     assert response.status_code == 200
     assert captured == {"reset_anchor": "rolling", "window_seconds": 10800}
     assert backend.records[0].plan_window_id == "configured-window"
+
+
+@pytest.mark.asyncio
+async def test_ledger_endpoint_reconciles_explicit_route_reservation(monkeypatch):
+    backend = _EndpointBackend()
+    reservation_id = "2f1feabc-3d2f-4ccd-81c8-2dca1e5d81e4"
+    backend.conn.execute(
+        "INSERT INTO knemon_burn_sessions VALUES (?, CURRENT_TIMESTAMP)",
+        ("user:root",),
+    )
+    backend.conn.execute(
+        """
+        INSERT INTO knemon_burn_reservations (
+          reservation_id, session_id, reserved_at, expires_at, request_count, status
+        ) VALUES (?, 'user:root', CURRENT_TIMESTAMP, '2999-01-01 00:00:00', 1, 'pending')
+        """,
+        (reservation_id,),
+    )
+    backend.conn.commit()
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+
+    app = FastAPI()
+    app.include_router(ledger_router)
+    app.dependency_overrides[get_current_user] = _root
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/ledger",
+            json={
+                "provider": "openai",
+                "model": "gpt-4o",
+                "task_kind": "code",
+                "tokens_in": 1,
+                "tokens_out": 1,
+                "latency_ms": 1,
+                "outcome": "ok",
+                "caller_subsystem": "pantheon",
+                "tier": "standard",
+                "reservation_id": reservation_id,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["reconciled_reservation_ids"] == [reservation_id]
+    status, ledger_id = backend.conn.execute(
+        "SELECT status, ledger_id FROM knemon_burn_reservations WHERE reservation_id = ?",
+        (reservation_id,),
+    ).fetchone()
+    assert (status, ledger_id) == ("reconciled", 7)
+
+
+@pytest.mark.asyncio
+async def test_ledger_endpoint_fails_closed_when_reservation_schema_is_missing(monkeypatch):
+    backend = _EndpointBackend()
+    backend.conn.execute("DROP TABLE knemon_burn_reservations")
+    backend.conn.commit()
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+
+    app = FastAPI()
+    app.include_router(ledger_router)
+    app.dependency_overrides[get_current_user] = _root
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/ledger",
+            json={
+                "provider": "openai",
+                "model": "gpt-4o",
+                "task_kind": "code",
+                "tokens_in": 1,
+                "tokens_out": 1,
+                "latency_ms": 1,
+                "outcome": "ok",
+                "caller_subsystem": "pantheon",
+                "tier": "standard",
+            },
+        )
+
+    assert response.status_code == 503
+    assert "apply migration 0040_knemon_burn_reservations" in response.json()["detail"]
+
+
+def test_burn_reservation_migrations_cover_all_supported_backends():
+    root = Path(__file__).resolve().parent.parent
+    migrations = [
+        root / "db/migrations/0040_knemon_burn_reservations.sql",
+        root / "db/migrations_sqlite/0040_knemon_burn_reservations.sql",
+        root / "db/migrations_mariadb/0040_knemon_burn_reservations.sql",
+        root / "db/migrations_oracle/0040_knemon_burn_reservations.sql",
+        root / "db/migrations_db2/0040_knemon_burn_reservations.sql",
+    ]
+
+    for migration in migrations:
+        sql = migration.read_text(encoding="utf-8").lower()
+        assert "knemon_burn_sessions" in sql
+        assert "knemon_burn_reservations" in sql
+        assert "pending" in sql and "reconciled" in sql and "released" in sql
 
 
 def test_usage_ledger_migrations_preserve_constraint_parity():

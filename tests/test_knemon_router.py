@@ -12,6 +12,7 @@ from mnemos.core import config as config_mod
 from mnemos.core.config import get_settings
 from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.domain.knemon.router import (
+    BurnReservationSchemaMissing,
     KnemonRouteRequest,
     NoModelAvailable,
     _apply_priority_ceiling,
@@ -20,6 +21,7 @@ from mnemos.domain.knemon.router import (
     _plan_is_effective,
     _plans_by_provider,
     _rows,
+    _reserve_session_burn,
     _worker_pools_for_session,
     _subscription_pool_aliases,
     route,
@@ -113,6 +115,20 @@ class _SqliteKnemonBackend:
               last_heartbeat REAL NOT NULL,
               status TEXT NOT NULL,
               subscription_pools TEXT
+            );
+            CREATE TABLE knemon_burn_sessions (
+              session_id TEXT PRIMARY KEY,
+              touched_at TIMESTAMP NOT NULL
+            );
+            CREATE TABLE knemon_burn_reservations (
+              reservation_id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              reserved_at TIMESTAMP NOT NULL,
+              expires_at TIMESTAMP NOT NULL,
+              request_count INTEGER NOT NULL DEFAULT 1,
+              status TEXT NOT NULL,
+              reconciled_at TIMESTAMP,
+              ledger_id INTEGER
             );
             """
         )
@@ -533,6 +549,122 @@ async def test_parallel_same_session_burn_tracking_serializes():
     decisions = await asyncio.gather(*(route(_req(14, "burned-session"), backend) for _ in range(10)))
     assert {decision.provider for decision in decisions} == {"xai"}
     assert backend.max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_route_reservation_closes_burn_threshold_race():
+    session_id = "reservation-boundary"
+    backend = _SqliteKnemonBackend(92, burned_session=session_id, burned_request_count=9)
+
+    decisions = await asyncio.gather(*(route(_req(14, session_id), backend) for _ in range(10)))
+
+    assert [decision.provider for decision in decisions].count("openai") == 1
+    assert [decision.provider for decision in decisions].count("xai") == 9
+    assert all(decision.reservation_id for decision in decisions)
+    pending = backend.conn.execute(
+        """
+        SELECT COUNT(*) FROM knemon_burn_reservations
+        WHERE session_id = ? AND status = 'pending'
+        """,
+        (session_id,),
+    ).fetchone()[0]
+    assert pending == 10
+
+
+@pytest.mark.asyncio
+async def test_reservations_are_shared_across_backend_instances(tmp_path):
+    database_path = tmp_path / "burn-reservations.sqlite3"
+    setup = sqlite3.connect(database_path)
+    setup.executescript(
+        """
+        CREATE TABLE usage_ledger (
+          ts TIMESTAMP NOT NULL,
+          session_id TEXT,
+          request_count INTEGER NOT NULL
+        );
+        CREATE TABLE knemon_burn_sessions (
+          session_id TEXT PRIMARY KEY,
+          touched_at TIMESTAMP NOT NULL
+        );
+        CREATE TABLE knemon_burn_reservations (
+          reservation_id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          reserved_at TIMESTAMP NOT NULL,
+          expires_at TIMESTAMP NOT NULL,
+          request_count INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          reconciled_at TIMESTAMP,
+          ledger_id INTEGER
+        );
+        """
+    )
+    setup.execute(
+        "INSERT INTO usage_ledger VALUES (?, 'shared-session', 9)",
+        (datetime.now(timezone.utc),),
+    )
+    setup.commit()
+    setup.close()
+
+    class SharedSqliteBackend:
+        @asynccontextmanager
+        async def transactional(self):
+            conn = sqlite3.connect(database_path, timeout=5)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except BaseException:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+            finally:
+                conn.close()
+
+    first = await _reserve_session_burn(SharedSqliteBackend(), "shared-session")
+    second = await _reserve_session_burn(SharedSqliteBackend(), "shared-session")
+
+    assert first.burned is False
+    assert second.burned is True
+    assert first.reservation_id != second.reservation_id
+
+
+@pytest.mark.asyncio
+async def test_failed_route_releases_its_reservation():
+    session_id = "no-model-release"
+    backend = _SqliteKnemonBackend(40, agent_session_id=session_id, subscription_pools=["chatgpt_plus"])
+    backend.conn.execute("DELETE FROM model_registry")
+    backend.conn.commit()
+
+    with pytest.raises(NoModelAvailable):
+        await route(_req(14, session_id), backend)
+
+    statuses = backend.conn.execute(
+        "SELECT status FROM knemon_burn_reservations WHERE session_id = ?",
+        (session_id,),
+    ).fetchall()
+    assert statuses == [("released",)]
+
+
+@pytest.mark.asyncio
+async def test_missing_reservation_schema_fails_closed_by_default():
+    backend = _SqliteKnemonBackend(40)
+    backend.conn.execute("DROP TABLE knemon_burn_reservations")
+    backend.conn.commit()
+
+    with pytest.raises(BurnReservationSchemaMissing, match="apply migration 0040"):
+        await route(_req(14, "migration-required"), backend)
+
+
+@pytest.mark.asyncio
+async def test_missing_reservation_schema_has_explicit_development_opt_out(monkeypatch):
+    backend = _SqliteKnemonBackend(40)
+    backend.conn.execute("DROP TABLE knemon_burn_reservations")
+    backend.conn.commit()
+    monkeypatch.setenv("MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT", "true")
+
+    decision = await route(_req(14, "development-only"), backend)
+
+    assert decision.reservation_id is None
 
 
 @pytest.mark.asyncio
