@@ -66,6 +66,17 @@ async def test_provider_cap_denies_even_when_global_has_headroom(patch_settings,
 
 
 @pytest.mark.asyncio
+async def test_configured_provider_cap_requires_provider(patch_settings, monkeypatch):
+    patch_settings(weekly=1000.0, provider_caps={"openai": 50.0})
+    _patch_spends(monkeypatch, total=10.0, per_provider={"openai": 50.0})
+
+    decision = await evaluate_usage_budget(object())
+
+    assert not decision.allowed
+    assert "provider is required" in decision.reason
+
+
+@pytest.mark.asyncio
 async def test_provider_under_cap_reports_tightest_remaining(patch_settings, monkeypatch):
     patch_settings(weekly=1000.0, provider_caps={"openai": 50.0})
     _patch_spends(monkeypatch, total=200.0, per_provider={"openai": 10.0})

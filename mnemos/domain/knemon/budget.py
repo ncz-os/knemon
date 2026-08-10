@@ -163,11 +163,23 @@ async def evaluate_usage_budget(
         limit_usd = configured if configured > 0 else None
 
     provider_key = (provider or "").strip().lower()
+    if provider_caps is None:
+        provider_caps = get_settings().knemon.parsed_provider_budget_caps_usd()
+    configured_provider_caps = {
+        str(name).strip().lower(): float(cap)
+        for name, cap in provider_caps.items()
+        if str(name).strip() and cap is not None and float(cap) > 0
+    }
+    if configured_provider_caps and not provider_key:
+        return BudgetDecision(
+            BudgetVerdict.DENY,
+            0.0,
+            "provider is required when provider budget caps are configured; failing closed",
+            limit_usd=limit_usd,
+        )
     provider_cap: float | None = None
     if provider_key:
-        if provider_caps is None:
-            provider_caps = get_settings().knemon.parsed_provider_budget_caps_usd()
-        candidate = provider_caps.get(provider_key)
+        candidate = configured_provider_caps.get(provider_key)
         if candidate is not None and candidate > 0:
             provider_cap = float(candidate)
 

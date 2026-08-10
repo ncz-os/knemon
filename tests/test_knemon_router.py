@@ -19,6 +19,8 @@ from mnemos.domain.knemon.router import (
     _fallback_bucket,
     _plan_is_effective,
     _plans_by_provider,
+    _rows,
+    _worker_pools_for_session,
     _subscription_pool_aliases,
     route,
 )
@@ -210,14 +212,16 @@ class _SqliteKnemonBackend:
                 """,
                 (now, extra_used, extra_window_id),
             )
-        if agent_session_id:
+        if agent_session_id or burned_session:
+            effective_agent_session = agent_session_id or burned_session
+            effective_pools = subscription_pools if agent_session_id else ["chatgpt_plus"]
             self.conn.execute(
                 """
                 INSERT INTO agents (
                   urn, kind, host, session_id, last_heartbeat, status, subscription_pools
                 ) VALUES ('urn:agent:test:1', 'codex', 'pytest', ?, ?, 'online', ?)
                 """,
-                (agent_session_id, now.timestamp(), json.dumps(subscription_pools or [])),
+                (effective_agent_session, now.timestamp(), json.dumps(effective_pools or [])),
             )
         self.conn.commit()
 
@@ -398,6 +402,82 @@ async def test_subscription_requires_caller_workspace_pool():
     assert decision.provider == "xai"
     assert decision.auth_method == "api"
     assert "lacks pool" in decision.reasoning
+
+
+@pytest.mark.asyncio
+async def test_unknown_worker_session_cannot_use_subscription_pool():
+    decision = await route(_req(14, "missing-worker"), _SqliteKnemonBackend(40))
+
+    assert decision.provider == "xai"
+    assert decision.auth_method == "api"
+
+
+@pytest.mark.asyncio
+async def test_worker_lookup_permission_error_is_not_swallowed():
+    class PermissionBackend:
+        @asynccontextmanager
+        async def transactional(self):
+            class Conn:
+                def cursor(self):
+                    class Cursor:
+                        async def execute(self, sql, params):
+                            raise RuntimeError("permission denied for table agents")
+
+                        async def close(self):
+                            return None
+
+                    return Cursor()
+
+            yield Conn()
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        await _worker_pools_for_session(PermissionBackend(), "worker")
+
+
+@pytest.mark.asyncio
+async def test_mysql_rows_convert_named_parameters_to_positional():
+    class MySQLCursor:
+        description = [("provider",)]
+
+        def __init__(self):
+            self.executed = None
+
+        async def execute(self, sql, params):
+            self.executed = (sql, params)
+
+        async def fetchall(self):
+            return [("openai",)]
+
+        async def close(self):
+            return None
+
+    class MySQLConnection:
+        def __init__(self):
+            self.cursor_obj = MySQLCursor()
+
+        def cursor(self):
+            return self.cursor_obj
+
+    class Backend:
+        def __init__(self):
+            self.conn = MySQLConnection()
+
+        @asynccontextmanager
+        async def transactional(self):
+            yield self.conn
+
+    backend = Backend()
+    rows = await _rows(
+        backend,
+        "SELECT provider FROM model_registry WHERE provider = :provider OR model_id = :provider",
+        {"provider": "openai"},
+    )
+
+    assert rows == [{"provider": "openai"}]
+    assert backend.conn.cursor_obj.executed == (
+        "SELECT provider FROM model_registry WHERE provider = %s OR model_id = %s",
+        ("openai", "openai"),
+    )
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 import mnemos.core.lifecycle as lifecycle
+import mnemos.api.routes.ledger as ledger_mod
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.routes.ledger import router as ledger_router
 from mnemos.core.plan_windows import _PLAN_WINDOWS
@@ -379,7 +380,7 @@ async def test_ledger_endpoint_requires_root_and_records(monkeypatch):
     recorded = backend.records[0]
     assert recorded.provider == "openai"
     assert recorded.model == "gpt-4o"
-    assert recorded.session_id is None
+    assert recorded.session_id == "user:root"
     assert recorded.request_count == 1
     assert recorded.path_kind == "api"
     assert recorded.plan_window_id is not None
@@ -420,6 +421,57 @@ async def test_ledger_endpoint_infers_known_subscription_path_kind(monkeypatch):
     assert recorded.path_kind == "interactive"
     assert recorded.plan_window_id is not None
     assert recorded.plan_window_id.startswith("openai-chatgpt_plus-")
+
+
+@pytest.mark.asyncio
+async def test_ledger_endpoint_uses_active_plan_window_configuration(monkeypatch):
+    backend = _EndpointBackend()
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+
+    async def plans(_backend):
+        return {
+            "openai": [
+                {
+                    "provider": "openai",
+                    "plan_name": "chatgpt_plus",
+                    "reset_anchor": "rolling",
+                    "msg_window_seconds": 10800,
+                }
+            ]
+        }
+
+    captured = {}
+
+    def compute(provider, tier, *args, **kwargs):
+        captured.update(kwargs)
+        return "configured-window"
+
+    monkeypatch.setattr(ledger_mod, "_plans_by_provider", plans)
+    monkeypatch.setattr(ledger_mod, "compute_plan_window_id", compute)
+
+    app = FastAPI()
+    app.include_router(ledger_router)
+    app.dependency_overrides[get_current_user] = _root
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/ledger",
+            json={
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "task_kind": "code",
+                "tokens_in": 1,
+                "tokens_out": 1,
+                "latency_ms": 1,
+                "outcome": "ok",
+                "caller_subsystem": "pantheon",
+                "tier": "chatgpt_plus",
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured == {"reset_anchor": "rolling", "window_seconds": 10800}
+    assert backend.records[0].plan_window_id == "configured-window"
 
 
 def test_usage_ledger_migrations_preserve_constraint_parity():

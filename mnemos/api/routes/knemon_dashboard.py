@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -15,6 +15,12 @@ from fastapi.responses import HTMLResponse
 from mnemos.api.dependencies import UserContext, require_root
 from mnemos.api.extra_guards import require_extra
 from mnemos.api.persistence_helpers import backend_or_503
+from mnemos.domain.knemon.router import (
+    _asyncpg_sql,
+    _dict_rows,
+    _is_mysql_connection,
+    _mysql_sql,
+)
 
 router = APIRouter(prefix="/v1/knemon", tags=["knemon"], dependencies=[require_extra("knemon", label="KNEMON")])
 
@@ -60,9 +66,21 @@ async def _rows(sql: str, params: dict[str, Any] | None = None) -> list[dict[str
     backend = backend_or_503()
     async with backend.transactional() as tx:
         conn = _conn_from_tx(tx)
+        fetch = getattr(conn, "fetch", None)
+        if callable(fetch):
+            pg_sql, pg_params = _asyncpg_sql(sql, params or {})
+            rows = _dict_rows(await _call(fetch, pg_sql, *pg_params))
+            return [
+                {name: _jsonable(await _materialize(value)) for name, value in row.items()}
+                for row in rows
+            ]
         cursor = await _call(conn.cursor)
         try:
-            await _call(cursor.execute, sql, params or {})
+            if _is_mysql_connection(conn):
+                mysql_sql, mysql_params = _mysql_sql(sql, params or {})
+                await _call(cursor.execute, mysql_sql, tuple(mysql_params))
+            else:
+                await _call(cursor.execute, sql, params or {})
             fetched = await _call(cursor.fetchall)
             names = [col[0].lower() for col in cursor.description]
             out: list[dict[str, Any]] = []
@@ -133,13 +151,16 @@ async def summary(_: UserContext = Depends(require_root)):
         return await _one(
             """
             SELECT COUNT(*) AS total_rows,
-                   NVL(SUM(est_cost_usd), 0) AS total_cost_usd,
-                   NVL(SUM(tokens_in), 0) AS total_tokens_in,
-                   NVL(SUM(tokens_out), 0) AS total_tokens_out,
-                   COUNT(DISTINCT provider || '/' || model) AS distinct_models,
-                   NVL(SUM(CASE WHEN ts >= SYSTIMESTAMP - INTERVAL '1' DAY THEN 1 ELSE 0 END), 0) AS last_24h_rows
+                   COALESCE(SUM(est_cost_usd), 0) AS total_cost_usd,
+                   COALESCE(SUM(tokens_in), 0) AS total_tokens_in,
+                   COALESCE(SUM(tokens_out), 0) AS total_tokens_out,
+                   (SELECT COUNT(*) FROM (
+                       SELECT provider, model FROM usage_ledger GROUP BY provider, model
+                   ) distinct_usage_models) AS distinct_models,
+                   COALESCE(SUM(CASE WHEN ts >= :since_ts THEN 1 ELSE 0 END), 0) AS last_24h_rows
             FROM usage_ledger
-            """
+            """,
+            {"since_ts": datetime.now(timezone.utc) - timedelta(days=1)},
         )
 
     return await _cached(("summary",), load)
@@ -152,8 +173,8 @@ async def by_provider(_: UserContext = Depends(require_root)):
             """
             SELECT provider,
                    COUNT(*) AS row_count,
-                   NVL(SUM(est_cost_usd), 0) AS cost_usd,
-                   NVL(SUM(tokens_in + tokens_out + tokens_reasoning), 0) AS tokens,
+                   COALESCE(SUM(est_cost_usd), 0) AS cost_usd,
+                   COALESCE(SUM(tokens_in + tokens_out + tokens_reasoning), 0) AS tokens,
                    ROUND(AVG(latency_ms), 2) AS avg_latency_ms
             FROM usage_ledger
             GROUP BY provider
@@ -167,23 +188,20 @@ async def by_provider(_: UserContext = Depends(require_root)):
 @router.get("/by_model")
 async def by_model(limit: int = Query(20, ge=1, le=200), _: UserContext = Depends(require_root)):
     async def load():
-        return await _rows(
+        rows = await _rows(
             """
-            SELECT * FROM (
-                SELECT provider,
-                       model,
-                       COUNT(*) AS row_count,
-                       NVL(SUM(est_cost_usd), 0) AS cost_usd,
-                       ROUND(AVG(tokens_in), 2) AS avg_tokens_in,
-                       ROUND(AVG(tokens_out), 2) AS avg_tokens_out
-                FROM usage_ledger
-                GROUP BY provider, model
-                ORDER BY cost_usd DESC, row_count DESC
-            )
-            WHERE ROWNUM <= :limit
-            """,
-            {"limit": limit},
+            SELECT provider,
+                   model,
+                   COUNT(*) AS row_count,
+                   COALESCE(SUM(est_cost_usd), 0) AS cost_usd,
+                   ROUND(AVG(tokens_in), 2) AS avg_tokens_in,
+                   ROUND(AVG(tokens_out), 2) AS avg_tokens_out
+            FROM usage_ledger
+            GROUP BY provider, model
+            ORDER BY cost_usd DESC, row_count DESC
+            """
         )
+        return rows[:limit]
 
     return await _cached(("by_model", limit), load)
 
@@ -195,7 +213,7 @@ async def by_caller(_: UserContext = Depends(require_root)):
             """
             SELECT caller_subsystem,
                    COUNT(*) AS row_count,
-                   NVL(SUM(est_cost_usd), 0) AS cost_usd
+                   COALESCE(SUM(est_cost_usd), 0) AS cost_usd
             FROM usage_ledger
             GROUP BY caller_subsystem
             ORDER BY cost_usd DESC, row_count DESC
@@ -212,7 +230,7 @@ async def by_task_kind(_: UserContext = Depends(require_root)):
             """
             SELECT task_kind,
                    COUNT(*) AS row_count,
-                   NVL(SUM(est_cost_usd), 0) AS cost_usd
+                   COALESCE(SUM(est_cost_usd), 0) AS cost_usd
             FROM usage_ledger
             GROUP BY task_kind
             ORDER BY cost_usd DESC, row_count DESC
@@ -224,21 +242,34 @@ async def by_task_kind(_: UserContext = Depends(require_root)):
 
 @router.get("/timeline")
 async def timeline(bucket: str = Query("1h", pattern="^(1h|1d)$"), _: UserContext = Depends(require_root)):
-    fmt = "'HH24'" if bucket == "1h" else "'DD'"
-
     async def load():
-        return await _rows(
-            f"""
-            SELECT TO_CHAR(TRUNC(CAST(SYS_EXTRACT_UTC(ts) AS TIMESTAMP), {fmt}),
-                           'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS ts_bucket,
-                   COUNT(*) AS row_count,
-                   NVL(SUM(est_cost_usd), 0) AS cost_usd
-            FROM usage_ledger
-            WHERE ts >= SYSTIMESTAMP - INTERVAL '7' DAY
-            GROUP BY TRUNC(CAST(SYS_EXTRACT_UTC(ts) AS TIMESTAMP), {fmt})
-            ORDER BY TRUNC(CAST(SYS_EXTRACT_UTC(ts) AS TIMESTAMP), {fmt})
+        rows = await _rows(
             """
+            SELECT ts, est_cost_usd
+            FROM usage_ledger
+            WHERE ts >= :since_ts
+            ORDER BY ts
+            """,
+            {"since_ts": datetime.now(timezone.utc) - timedelta(days=7)},
         )
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            value = row.get("ts")
+            if isinstance(value, str):
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if not isinstance(value, datetime):
+                continue
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            value = value.astimezone(timezone.utc)
+            start = value.replace(minute=0, second=0, microsecond=0)
+            if bucket == "1d":
+                start = start.replace(hour=0)
+            key = _jsonable(start)
+            item = grouped.setdefault(key, {"ts_bucket": key, "row_count": 0, "cost_usd": 0.0})
+            item["row_count"] += 1
+            item["cost_usd"] += float(row.get("est_cost_usd") or 0)
+        return [grouped[key] for key in sorted(grouped)]
 
     return await _cached(("timeline", bucket), load)
 
@@ -246,7 +277,7 @@ async def timeline(bucket: str = Query("1h", pattern="^(1h|1d)$"), _: UserContex
 @router.get("/recent")
 async def recent(limit: int = Query(50, ge=1, le=500), _: UserContext = Depends(require_root)):
     async def load():
-        return await _rows(
+        rows = await _rows(
             """
             SELECT provider,
                    model,
@@ -254,16 +285,11 @@ async def recent(limit: int = Query(50, ge=1, le=500), _: UserContext = Depends(
                    est_cost_usd,
                    outcome,
                    ts
-            FROM (
-                SELECT provider, model, tokens_in, tokens_out, tokens_reasoning,
-                       est_cost_usd, outcome, ts
-                FROM usage_ledger
-                ORDER BY ts DESC
-            )
-            WHERE ROWNUM <= :limit
-            """,
-            {"limit": limit},
+            FROM usage_ledger
+            ORDER BY ts DESC
+            """
         )
+        return rows[:limit]
 
     return await _cached(("recent", limit), load)
 
@@ -306,7 +332,7 @@ async def recommendations(task_type: str | None = None, _: UserContext = Depends
                    output_cost_per_mtok, capabilities, arena_score, arena_rank,
                    graeae_weight, context_window
             FROM model_registry
-            WHERE available = 1 AND NVL(deprecated, 0) = 0
+            WHERE available = 1 AND COALESCE(deprecated, 0) = 0
             """
         )
         candidates = []

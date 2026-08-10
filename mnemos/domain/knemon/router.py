@@ -162,6 +162,24 @@ def _asyncpg_sql(sql: str, params: dict[str, Any]) -> tuple[str, list[Any]]:
     return _NAMED_PARAM_RE.sub(replace, sql), values
 
 
+def _mysql_sql(sql: str, params: dict[str, Any]) -> tuple[str, list[Any]]:
+    values: list[Any] = []
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in params:
+            return match.group(0)
+        values.append(params[name])
+        return "%s"
+
+    return _NAMED_PARAM_RE.sub(replace, sql), values
+
+
+def _is_mysql_connection(conn: Any) -> bool:
+    identity = f"{type(conn).__module__}.{type(conn).__name__}".lower()
+    return any(marker in identity for marker in ("mysql", "mariadb", "aiomysql", "asyncmy"))
+
+
 def _dict_rows(rows: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for row in rows or []:
@@ -186,7 +204,11 @@ async def _rows(backend: Any, sql: str, params: dict[str, Any] | None = None) ->
 
         cursor = await _call(conn.cursor)
         try:
-            await _call(cursor.execute, sql, params or {})
+            if _is_mysql_connection(conn):
+                mysql_sql, mysql_params = _mysql_sql(sql, params or {})
+                await _call(cursor.execute, mysql_sql, tuple(mysql_params))
+            else:
+                await _call(cursor.execute, sql, params or {})
             fetched = await _call(cursor.fetchall)
             description = getattr(cursor, "description", None) or []
             names = [str(col[0]).lower() for col in description]
@@ -331,6 +353,29 @@ def _candidate_plan_family(candidate: dict[str, Any] | None) -> str | None:
     return "chatgpt_subscription"
 
 
+def _is_missing_worker_schema_error(exc: Exception) -> bool:
+    """Recognize only driver errors for an absent agents table/column."""
+    sqlstate = str(getattr(exc, "sqlstate", "") or getattr(exc, "pgcode", ""))
+    errno = getattr(exc, "errno", None)
+    sqlcode = str(getattr(exc, "sqlcode", ""))
+    message = str(exc).lower()
+    if sqlstate in {"42P01", "42703", "42704"}:
+        return True
+    if errno in {1054, 1146}:
+        return True
+    if sqlcode in {"-204", "-206"}:
+        return True
+    return any(
+        marker in message
+        for marker in (
+            "no such table: agents",
+            "no such column: subscription_pools",
+            "ora-00942",
+            "ora-00904",
+        )
+    )
+
+
 async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set[str] | None:
     if not session_id:
         return None
@@ -350,9 +395,9 @@ async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set
         )
     except Exception as exc:
         msg = str(exc).lower()
+        if _is_missing_worker_schema_error(exc):
+            return set()
         if "fetch" not in msg:
-            if "agents" in msg or "subscription_pools" in msg or "no such table" in msg or "no such column" in msg:
-                return None
             raise
         try:
             rows = await _rows(
@@ -368,18 +413,12 @@ async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set
                 {"session_id": session_id},
             )
         except Exception as fallback_exc:
-            fallback_msg = str(fallback_exc).lower()
-            if (
-                "agents" in fallback_msg
-                or "subscription_pools" in fallback_msg
-                or "no such table" in fallback_msg
-                or "no such column" in fallback_msg
-            ):
-                return None
+            if _is_missing_worker_schema_error(fallback_exc):
+                return set()
             raise
     if rows:
         return _normalize_pools(rows[0].get("subscription_pools"))
-    return None
+    return set()
 
 
 def _worker_has_pool(worker_pools: set[str] | None, plan: dict[str, Any]) -> bool:
