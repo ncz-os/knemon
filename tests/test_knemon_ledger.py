@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from decimal import Decimal
 from importlib.resources import files
 from types import SimpleNamespace
@@ -15,6 +16,8 @@ import mnemos.core.lifecycle as lifecycle
 import mnemos.api.routes.ledger as ledger_mod
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.routes.ledger import router as ledger_router
+from mnemos.core.config import get_settings
+from mnemos.domain.knemon.router import _reserve_session_burn, reconcile_burn_reservation
 from mnemos.core.plan_windows import _PLAN_WINDOWS
 from mnemos.persistence.base import UsageLedgerRecord, UsageLedgerResult
 from mnemos.persistence.postgres import PostgresBackend, PostgresTransaction
@@ -299,6 +302,12 @@ class _EndpointBackend:
               reconciled_at TIMESTAMP,
               ledger_id INTEGER
             );
+            CREATE TABLE usage_ledger (
+              id INTEGER PRIMARY KEY,
+              ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              session_id TEXT,
+              request_count INTEGER NOT NULL DEFAULT 1
+            );
             """
         )
 
@@ -314,6 +323,10 @@ class _EndpointBackend:
 
     async def record_usage_ledger(self, tx, record: UsageLedgerRecord) -> UsageLedgerResult:
         self.records.append(record)
+        tx.execute(
+            "INSERT INTO usage_ledger (id, ts, session_id, request_count) VALUES (7, ?, ?, ?)",
+            (datetime.now(timezone.utc), record.session_id, record.request_count),
+        )
         return UsageLedgerResult(id=7, est_cost_usd=Decimal("0.000324"))
 
 
@@ -450,6 +463,49 @@ async def test_ledger_endpoint_infers_known_subscription_path_kind(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_audit_session_usage_is_enforced_against_authenticated_principal(monkeypatch):
+    backend = _EndpointBackend()
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+    monkeypatch.setattr(get_settings().knemon, "session_burn_requests_per_hour", 10)
+
+    app = FastAPI()
+    app.include_router(ledger_router)
+    app.dependency_overrides[get_current_user] = _root
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/ledger",
+            json={
+                "provider": "openai",
+                "model": "gpt-4o",
+                "task_kind": "code",
+                "tokens_in": 1,
+                "tokens_out": 1,
+                "latency_ms": 1,
+                "outcome": "ok",
+                "caller_subsystem": "stiphos",
+                "tier": "standard",
+                "session_id": "stiphos-job:123",
+                "request_count": 10,
+            },
+        )
+
+    assert response.status_code == 200
+    assert backend.records[0].session_id == "stiphos-job:123"
+    mapped_usage = backend.conn.execute(
+        """
+        SELECT SUM(ledger.request_count)
+        FROM usage_ledger ledger
+        JOIN knemon_ledger_principals principals ON principals.ledger_id = ledger.id
+        WHERE principals.principal_id = 'user:root'
+        """
+    ).fetchone()[0]
+    assert mapped_usage == 10
+    reservation = await _reserve_session_burn(backend, "user:root")
+    assert reservation.burned is True
+
+
+@pytest.mark.asyncio
 async def test_ledger_endpoint_uses_active_plan_window_configuration(monkeypatch):
     backend = _EndpointBackend()
     monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
@@ -549,6 +605,48 @@ async def test_ledger_endpoint_reconciles_explicit_route_reservation(monkeypatch
         (reservation_id,),
     ).fetchone()
     assert (status, ledger_id) == ("reconciled", 7)
+    principal = backend.conn.execute(
+        "SELECT principal_id FROM knemon_ledger_principals WHERE ledger_id = 7"
+    ).fetchone()
+    assert principal == ("user:root",)
+
+
+@pytest.mark.asyncio
+async def test_tokenless_reconciliation_skips_expired_reservation():
+    backend = _EndpointBackend()
+    backend.conn.execute(
+        "INSERT INTO knemon_burn_sessions VALUES ('user:root', CURRENT_TIMESTAMP)"
+    )
+    backend.conn.executemany(
+        """
+        INSERT INTO knemon_burn_reservations (
+          reservation_id, session_id, reserved_at, expires_at, request_count, status
+        ) VALUES (?, 'user:root', ?, ?, 1, 'pending')
+        """,
+        [
+            ("00000000-0000-0000-0000-000000000001", "2026-01-01", "2026-01-02"),
+            ("00000000-0000-0000-0000-000000000002", "2026-08-11", "2999-01-01"),
+        ],
+    )
+    backend.conn.commit()
+
+    async with backend.transactional() as tx:
+        reconciled = await reconcile_burn_reservation(
+            tx,
+            reservation_id=None,
+            session_id="user:root",
+            ledger_id=7,
+            request_count=1,
+        )
+
+    assert reconciled == ["00000000-0000-0000-0000-000000000002"]
+    statuses = backend.conn.execute(
+        "SELECT reservation_id, status FROM knemon_burn_reservations ORDER BY reservation_id"
+    ).fetchall()
+    assert statuses == [
+        ("00000000-0000-0000-0000-000000000001", "pending"),
+        ("00000000-0000-0000-0000-000000000002", "reconciled"),
+    ]
 
 
 @pytest.mark.asyncio

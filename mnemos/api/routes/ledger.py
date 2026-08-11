@@ -15,8 +15,10 @@ from mnemos.core.plan_windows import compute_plan_window_id, plan_path_kind
 from mnemos.domain.knemon.router import (
     BurnReservationConflict,
     _allow_nonatomic_burn_development,
+    _conn_from_tx,
     _is_burn_reservation_schema_missing,
     _plans_by_provider,
+    _tx_execute,
     reconcile_burn_reservation,
 )
 from mnemos.domain.knemon.migrations import ensure_knemon_schema
@@ -113,12 +115,23 @@ async def record_ledger_usage(
             except Exception as exc:
                 raise HTTPException(
                     status_code=503,
-                    detail=f"KNEMON schema migration 0052_knemon_burn_reservations failed: {exc}",
+                    detail=(
+                        "KNEMON schema migrations 0052_knemon_burn_reservations and "
+                        f"0053_knemon_ledger_principals failed: {exc}"
+                    ),
                 ) from exc
         async with backend.transactional() as tx:
             result = await recorder(tx, record)
             reconciled = []
             if not _allow_nonatomic_burn_development():
+                await _tx_execute(
+                    _conn_from_tx(tx),
+                    """
+                    INSERT INTO knemon_ledger_principals (ledger_id, principal_id)
+                    VALUES (:ledger_id, :principal_id)
+                    """,
+                    {"ledger_id": result.id, "principal_id": enforcement_principal},
+                )
                 reconciled = await reconcile_burn_reservation(
                     tx,
                     reservation_id=payload.reservation_id,
@@ -138,7 +151,8 @@ async def record_ledger_usage(
                 status_code=503,
                 detail=(
                     "KNEMON atomic burn reservation schema is missing; apply migration "
-                    "0052_knemon_burn_reservations and restart. For development or a single-worker "
+                    "0052_knemon_burn_reservations and 0053_knemon_ledger_principals, then restart. "
+                    "For development or a single-worker "
                     "deployment only, set MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT=true."
                 ),
             )

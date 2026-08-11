@@ -83,6 +83,9 @@ class KnemonRouteDecision:
     dispatch_required_capabilities: list[str] = field(default_factory=list)
     dispatch_cost_tier: str = ""
     dispatch_subscription_pools: list[str] = field(default_factory=list)
+    # Exact selected subscription tier. Alias pools are dispatch capabilities,
+    # not a stable accounting key, so ledger producers must use this value.
+    plan_name: str = ""
     # Durable burn-accounting reservation. Callers should return this token on
     # the corresponding /v1/ledger write. Optional fields preserve the public
     # response contract for clients that have not adopted reservations yet.
@@ -413,7 +416,10 @@ def _is_burn_reservation_schema_missing(exc: Exception) -> bool:
     errno = getattr(exc, "errno", None)
     sqlcode = str(getattr(exc, "sqlcode", ""))
     message = str(exc).lower()
-    table_named = "knemon_burn_sessions" in message or "knemon_burn_reservations" in message
+    table_named = any(
+        table in message
+        for table in ("knemon_burn_sessions", "knemon_burn_reservations", "knemon_ledger_principals")
+    )
     return (
         (sqlstate in {"42P01", "42704"} and table_named)
         or (errno == 1146 and table_named)
@@ -522,7 +528,8 @@ async def _reserve_session_burn(backend: Any, session_id: str | None) -> _BurnRe
         await ensure_knemon_schema(backend)
     except Exception as exc:
         raise BurnReservationSchemaMissing(
-            f"KNEMON schema migration 0052_knemon_burn_reservations failed: {exc}"
+            f"KNEMON schema migrations 0052_knemon_burn_reservations and "
+            f"0053_knemon_ledger_principals failed: {exc}"
         ) from exc
     now = datetime.now(timezone.utc)
     await _cleanup_burn_reservations(backend, now=now)
@@ -537,8 +544,13 @@ async def _reserve_session_burn(backend: Any, session_id: str | None) -> _BurnRe
                 conn,
                 """
                 SELECT COALESCE(SUM(request_count), 0) AS requests_used
-                FROM usage_ledger
-                WHERE session_id = :session_id AND ts >= :since_ts
+                FROM usage_ledger ledger
+                WHERE ts >= :since_ts
+                  AND EXISTS (
+                    SELECT 1 FROM knemon_ledger_principals principals
+                    WHERE principals.ledger_id = ledger.id
+                      AND principals.principal_id = :session_id
+                  )
                 """,
                 {"session_id": session_id, "since_ts": since},
             )
@@ -579,7 +591,8 @@ async def _reserve_session_burn(backend: Any, session_id: str | None) -> _BurnRe
             return _BurnReservation(None, None, await _session_burned(backend, session_id))
         raise BurnReservationSchemaMissing(
             "KNEMON atomic burn reservation schema is missing; apply migration "
-            "0052_knemon_burn_reservations and restart. For development or a single-worker "
+            "0052_knemon_burn_reservations and 0053_knemon_ledger_principals, then restart. "
+            "For development or a single-worker "
             "deployment only, set MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT=true "
             "to use legacy non-atomic accounting."
         ) from exc
@@ -645,9 +658,10 @@ async def reconcile_burn_reservation(
             SELECT reservation_id
             FROM knemon_burn_reservations
             WHERE session_id = :session_id AND status = 'pending'
+              AND expires_at > :now_ts
             ORDER BY reserved_at, reservation_id
             """,
-            {"session_id": session_id},
+            {"session_id": session_id, "now_ts": now},
         )
         selected_ids = [str(row["reservation_id"]) for row in rows[: max(0, int(request_count))]]
 
@@ -1127,15 +1141,24 @@ async def _session_burned(backend: Any, session_id: str | None) -> bool:
     if threshold <= 0:
         return False
     since = datetime.now(timezone.utc) - timedelta(seconds=policy.session_burn_window_seconds)
-    rows = await _rows(
-        backend,
+    if _allow_nonatomic_burn_development():
+        sql = """
+            SELECT COALESCE(SUM(request_count), 0) AS requests_used
+            FROM usage_ledger
+            WHERE session_id = :session_id AND ts >= :since_ts
         """
-        SELECT COALESCE(SUM(request_count), 0) AS requests_used
-        FROM usage_ledger
-        WHERE session_id = :session_id AND ts >= :since_ts
-        """,
-        {"session_id": session_id, "since_ts": since},
-    )
+    else:
+        sql = """
+            SELECT COALESCE(SUM(request_count), 0) AS requests_used
+            FROM usage_ledger ledger
+            WHERE ts >= :since_ts
+              AND EXISTS (
+                SELECT 1 FROM knemon_ledger_principals principals
+                WHERE principals.ledger_id = ledger.id
+                  AND principals.principal_id = :session_id
+              )
+        """
+    rows = await _rows(backend, sql, {"session_id": session_id, "since_ts": since})
     return _to_int((rows[0] if rows else {}).get("requests_used")) >= threshold
 
 
@@ -1380,6 +1403,7 @@ async def _route_locked(
             if selected.get("auth_method") == "subscription"
             else []
         ),
+        plan_name=str(selected.get("plan_name") or "api"),
         reservation_id=reservation.reservation_id,
         reservation_expires_at=(reservation.expires_at.isoformat() if reservation.expires_at else None),
     )

@@ -12,7 +12,12 @@ from importlib.resources import files
 from typing import Any
 
 
-MIGRATION_NAME = "0052_knemon_burn_reservations.sql"
+MIGRATION_NAMES = (
+    "0052_knemon_burn_reservations.sql",
+    "0053_knemon_ledger_principals.sql",
+)
+# Backward-compatible name retained for integrations that imported it.
+MIGRATION_NAME = MIGRATION_NAMES[0]
 _MIGRATION_LOCK = asyncio.Lock()
 _MIGRATED_BACKENDS: dict[int, Any] = {}
 
@@ -25,6 +30,10 @@ async def _schema_present(backend: Any) -> bool:
             await _tx_rows(
                 _conn_from_tx(tx),
                 "SELECT reservation_id FROM knemon_burn_reservations WHERE 1 = 0",
+            )
+            await _tx_rows(
+                _conn_from_tx(tx),
+                "SELECT ledger_id FROM knemon_ledger_principals WHERE 1 = 0",
             )
         return True
     except Exception as exc:
@@ -73,22 +82,25 @@ async def ensure_knemon_schema(backend: Any) -> None:
             directory = "migrations_mariadb" if dialect == "mysql" else f"migrations_{dialect}"
             if dialect == "postgres":
                 directory = "migrations"
-            resource = files("mnemos.domain.knemon.db_migrations").joinpath(directory, MIGRATION_NAME)
-            sql = resource.read_text(encoding="utf-8")
-            for statement in _statements(sql, dialect):
-                try:
-                    await _tx_execute(conn, statement)
-                except Exception as exc:
-                    message = str(exc).lower()
-                    if dialect == "mysql" and (
-                        getattr(exc, "errno", None) == 1061 or "duplicate key name" in message
-                    ):
-                        continue
-                    raise
+            for migration_name in MIGRATION_NAMES:
+                resource = files("mnemos.domain.knemon.db_migrations").joinpath(directory, migration_name)
+                sql = resource.read_text(encoding="utf-8")
+                for statement in _statements(sql, dialect):
+                    try:
+                        await _tx_execute(conn, statement)
+                    except Exception as exc:
+                        message = str(exc).lower()
+                        if dialect == "mysql" and (
+                            getattr(exc, "errno", None) == 1061 or "duplicate key name" in message
+                        ):
+                            continue
+                        raise
 
         if not await _schema_present(backend):
-            raise RuntimeError(f"KNEMON migration {MIGRATION_NAME} completed without creating its schema")
+            raise RuntimeError(
+                f"KNEMON migrations {', '.join(MIGRATION_NAMES)} completed without creating their schema"
+            )
         _MIGRATED_BACKENDS[backend_key] = backend
 
 
-__all__ = ["MIGRATION_NAME", "ensure_knemon_schema"]
+__all__ = ["MIGRATION_NAME", "MIGRATION_NAMES", "ensure_knemon_schema"]

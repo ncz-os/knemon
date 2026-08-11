@@ -278,7 +278,29 @@ async def test_single_est_tokens_request_shape_supported():
     )
     decision = await route(req, _SqliteKnemonBackend(40))
     assert decision.provider == "openai"
+    assert decision.plan_name == "chatgpt_plus"
     assert decision.auth_method == "subscription"
+
+
+@pytest.mark.asyncio
+async def test_decision_exposes_exact_selected_leaf_plan_name():
+    backend = _SqliteKnemonBackend(
+        40,
+        agent_session_id="leaf-plan-worker",
+        subscription_pools=["codex_pro_200"],
+    )
+    backend.conn.execute(
+        """
+        UPDATE subscription_plans
+        SET plan_name = 'codex_pro_200_20x', parent_plan_id = 'codex_pro_200'
+        WHERE provider = 'openai'
+        """
+    )
+    backend.conn.commit()
+
+    decision = await route(_req(14, "leaf-plan-worker"), backend)
+
+    assert decision.plan_name == "codex_pro_200_20x"
 
 
 @pytest.mark.parametrize("utilization_pct", [40, 70, 92, 100])
@@ -580,10 +602,11 @@ async def test_reservations_are_shared_across_backend_instances(tmp_path):
     setup = sqlite3.connect(database_path)
     setup.executescript(
         """
-        CREATE TABLE usage_ledger (
-          ts TIMESTAMP NOT NULL,
-          session_id TEXT,
-          request_count INTEGER NOT NULL
+            CREATE TABLE usage_ledger (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TIMESTAMP NOT NULL,
+              session_id TEXT,
+              request_count INTEGER NOT NULL
         );
         CREATE TABLE knemon_burn_sessions (
           session_id TEXT PRIMARY KEY,
@@ -602,7 +625,7 @@ async def test_reservations_are_shared_across_backend_instances(tmp_path):
         """
     )
     setup.execute(
-        "INSERT INTO usage_ledger VALUES (?, 'shared-session', 9)",
+            "INSERT INTO usage_ledger (ts, session_id, request_count) VALUES (?, 'shared-session', 9)",
         (datetime.now(timezone.utc),),
     )
     setup.commit()
