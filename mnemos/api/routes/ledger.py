@@ -19,6 +19,7 @@ from mnemos.domain.knemon.router import (
     _plans_by_provider,
     reconcile_burn_reservation,
 )
+from mnemos.domain.knemon.migrations import ensure_knemon_schema
 from mnemos.persistence.base import UsageLedgerRecord
 
 router = APIRouter(prefix="/v1", tags=["ledger"], dependencies=[require_extra("knemon", label="KNEMON")])
@@ -95,7 +96,10 @@ async def record_ledger_usage(
         raise HTTPException(status_code=503, detail="usage_ledger requires a ledger-capable backend")
 
     record_payload = payload.model_dump(exclude={"reservation_id"})
+    # Preserve the caller session as an audit/workspace label. Reservation
+    # ownership is checked against the authenticated, server-derived principal.
     record_payload["session_id"] = payload.session_id or f"user:{user.user_id}"
+    enforcement_principal = f"user:{user.user_id}"
     record_payload["path_kind"] = plan_path_kind(payload.provider, payload.tier, payload.path_kind)
     window_options = await _plan_window_options(backend, payload.provider, payload.tier)
     record = UsageLedgerRecord(
@@ -103,6 +107,14 @@ async def record_ledger_usage(
         plan_window_id=compute_plan_window_id(payload.provider, payload.tier, **window_options),
     )
     try:
+        if not _allow_nonatomic_burn_development():
+            try:
+                await ensure_knemon_schema(backend)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"KNEMON schema migration 0052_knemon_burn_reservations failed: {exc}",
+                ) from exc
         async with backend.transactional() as tx:
             result = await recorder(tx, record)
             reconciled = []
@@ -110,12 +122,14 @@ async def record_ledger_usage(
                 reconciled = await reconcile_burn_reservation(
                     tx,
                     reservation_id=payload.reservation_id,
-                    session_id=str(record.session_id),
+                    session_id=enforcement_principal,
                     ledger_id=result.id,
                     request_count=record.request_count,
                 )
     except NotImplementedError:
         raise HTTPException(status_code=503, detail="usage_ledger requires a ledger-capable backend")
+    except HTTPException:
+        raise
     except BurnReservationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except Exception as exc:
@@ -124,7 +138,7 @@ async def record_ledger_usage(
                 status_code=503,
                 detail=(
                     "KNEMON atomic burn reservation schema is missing; apply migration "
-                    "0040_knemon_burn_reservations and restart. For development or a single-worker "
+                    "0052_knemon_burn_reservations and restart. For development or a single-worker "
                     "deployment only, set MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT=true."
                 ),
             )

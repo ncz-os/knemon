@@ -49,12 +49,16 @@ for the same session. Abandoned reservations stop counting after
 `MNEMOS_KNEMON_BURN_RESERVATION_TTL_SECONDS`, which defaults to the configured
 session-burn window.
 
-Apply `0040_knemon_burn_reservations.sql` for the active database backend before
-deploying this release. Routing and ledger writes fail closed with an actionable
-error when the tables are absent. Development and single-worker deployments can
-temporarily opt into the legacy non-atomic behavior with
-`MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT=true`; this setting is not safe
-for production or multiple workers.
+The wheel includes backend-specific `0052_knemon_burn_reservations.sql` files.
+KNEMON applies the applicable idempotent migration before the first atomic route
+or ledger write, including when upgrading an already-populated database.
+Terminal and long-expired reservations are purged during routing after seven
+days by default. Configure that audit window with
+`MNEMOS_KNEMON_BURN_RESERVATION_RETENTION_SECONDS` and the cleanup cadence with
+`MNEMOS_KNEMON_BURN_RESERVATION_CLEANUP_INTERVAL_SECONDS`. Development and
+single-worker deployments can temporarily opt into the legacy non-atomic
+behavior with `MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT=true`; this
+setting is not safe for production or multiple workers.
 
 
 ## Build infrastructure & partners

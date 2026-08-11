@@ -8,22 +8,25 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import knemon_router as knemon_router_api
 from mnemos.core import config as config_mod
 from mnemos.core.config import get_settings
 from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.domain.knemon.router import (
-    BurnReservationSchemaMissing,
     KnemonRouteRequest,
     NoModelAvailable,
     _apply_priority_ceiling,
     _best_plan,
     _fallback_bucket,
     _plan_is_effective,
+    _LAST_RESERVATION_CLEANUP,
+    _cleanup_burn_reservations,
     _plans_by_provider,
-    _rows,
     _reserve_session_burn,
-    _worker_pools_for_session,
+    _rows,
     _subscription_pool_aliases,
+    _worker_pools_for_session,
     route,
 )
 
@@ -646,13 +649,95 @@ async def test_failed_route_releases_its_reservation():
 
 
 @pytest.mark.asyncio
-async def test_missing_reservation_schema_fails_closed_by_default():
+async def test_missing_reservation_schema_is_migrated_before_default_route():
     backend = _SqliteKnemonBackend(40)
+    usage_rows_before = backend.conn.execute("SELECT COUNT(*) FROM usage_ledger").fetchone()[0]
     backend.conn.execute("DROP TABLE knemon_burn_reservations")
     backend.conn.commit()
 
-    with pytest.raises(BurnReservationSchemaMissing, match="apply migration 0040"):
-        await route(_req(14, "migration-required"), backend)
+    decision = await route(_req(14, "migration-required"), backend)
+
+    assert decision.reservation_id is not None
+    assert backend.conn.execute(
+        "SELECT COUNT(*) FROM knemon_burn_reservations"
+    ).fetchone()[0] == 1
+    assert backend.conn.execute("SELECT COUNT(*) FROM usage_ledger").fetchone()[0] == usage_rows_before
+    indexes = {
+        row[1] for row in backend.conn.execute("PRAGMA index_list(knemon_burn_reservations)")
+    }
+    assert "idx_knemon_burn_reservations_retention" in indexes
+
+
+@pytest.mark.asyncio
+async def test_reservation_cleanup_removes_only_rows_past_retention(monkeypatch):
+    backend = _SqliteKnemonBackend(40)
+    now = datetime.now(timezone.utc)
+    old = now - timedelta(days=8)
+    recent = now - timedelta(days=1)
+    backend.conn.execute("INSERT OR IGNORE INTO knemon_burn_sessions VALUES ('old', ?)", (old,))
+    backend.conn.execute("INSERT OR IGNORE INTO knemon_burn_sessions VALUES ('recent', ?)", (recent,))
+    backend.conn.executemany(
+        """
+        INSERT INTO knemon_burn_reservations (
+          reservation_id, session_id, reserved_at, expires_at, request_count,
+          status, reconciled_at, ledger_id
+        ) VALUES (?, ?, ?, ?, 1, 'reconciled', ?, 1)
+        """,
+        [
+            ("old-reservation", "old", old, old, old),
+            ("recent-reservation", "recent", recent, recent, recent),
+        ],
+    )
+    backend.conn.commit()
+    _LAST_RESERVATION_CLEANUP.pop(id(backend), None)
+    monkeypatch.setenv("MNEMOS_KNEMON_BURN_RESERVATION_RETENTION_SECONDS", str(7 * 86400))
+
+    await _cleanup_burn_reservations(backend, now=now)
+
+    assert backend.conn.execute(
+        "SELECT reservation_id FROM knemon_burn_reservations ORDER BY reservation_id"
+    ).fetchall() == [("recent-reservation",)]
+
+
+@pytest.mark.asyncio
+async def test_api_session_rotation_does_not_rotate_burn_principal(monkeypatch):
+    backend = _SqliteKnemonBackend(92, burned_session="user:root", burned_request_count=10)
+    now = datetime.now(timezone.utc).timestamp()
+    backend.conn.executemany(
+        """
+        INSERT INTO agents (urn, kind, host, session_id, last_heartbeat, status, subscription_pools)
+        VALUES (?, 'codex', 'pytest', ?, ?, 'online', '["chatgpt_plus"]')
+        """,
+        [("urn:agent:r11", "r11", now), ("urn:agent:r12", "r12", now)],
+    )
+    backend.conn.commit()
+    monkeypatch.setattr(knemon_router_api, "backend_or_503", lambda: backend)
+    root = UserContext(
+        user_id="root", group_ids=[], role="root", namespace="default", authenticated=True
+    )
+
+    decisions = []
+    for caller_session_id in ("r11", "r12"):
+        decisions.append(
+            await knemon_router_api.route_knemon(
+                task_kind="code-fix",
+                priority=14,
+                est_tokens_in=10_000,
+                est_tokens_out=2_000,
+                caller_session_id=caller_session_id,
+                caller_subsystem="api",
+                exclude_providers=None,
+                require_capability="code",
+                max_cost_tier=None,
+                user=root,
+            )
+        )
+
+    assert {decision["provider"] for decision in decisions} == {"xai"}
+    principals = backend.conn.execute(
+        "SELECT DISTINCT session_id FROM knemon_burn_reservations"
+    ).fetchall()
+    assert principals == [("user:root",)]
 
 
 @pytest.mark.asyncio

@@ -89,6 +89,23 @@ async def test_dashboard_rows_use_db2_qmark_paramstyle():
     assert conn.cursor_obj.executed == ("SELECT ? AS value", (7,))
 
 
+@pytest.mark.asyncio
+async def test_utilization_rows_use_db2_qmark_paramstyle(monkeypatch):
+    conn = _Db2Connection()
+
+    class Backend:
+        @asynccontextmanager
+        async def transactional(self):
+            yield conn
+
+    monkeypatch.setattr(knemon_utilization, "backend_or_503", lambda: Backend())
+
+    rows = await knemon_utilization._rows("SELECT :value AS value", {"value": 7})
+
+    assert rows == [{"value": 7}]
+    assert conn.cursor_obj.executed == ("SELECT ? AS value", (7,))
+
+
 @pytest.mark.parametrize(
     ("dialect", "clause"),
     [

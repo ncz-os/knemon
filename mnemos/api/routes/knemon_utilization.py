@@ -15,9 +15,11 @@ from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.domain.knemon.router import (
     _asyncpg_sql,
+    _connection_dialect,
     _dict_rows,
     _is_mysql_connection,
     _mysql_sql,
+    _qmark_sql,
 )
 
 router = APIRouter(prefix="/v1/knemon", tags=["knemon"], dependencies=[require_extra("knemon", label="KNEMON")])
@@ -58,6 +60,9 @@ async def _rows(sql: str, params: dict[str, Any] | None = None) -> list[dict[str
             if _is_mysql_connection(conn):
                 mysql_sql, mysql_params = _mysql_sql(sql, params or {})
                 await _call(cursor.execute, mysql_sql, tuple(mysql_params))
+            elif _connection_dialect(conn) == "db2":
+                db2_sql, db2_params = _qmark_sql(sql, params or {})
+                await _call(cursor.execute, db2_sql, tuple(db2_params))
             else:
                 await _call(cursor.execute, sql, params or {})
             fetched = await _call(cursor.fetchall)

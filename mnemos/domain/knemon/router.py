@@ -55,6 +55,10 @@ class KnemonRouteRequest:
     require_capability: list[str] = field(default_factory=list)
     max_cost_tier: Optional[str] = None
     est_tokens: Optional[int] = None
+    # Stable, server-derived identity used only for burn enforcement.  The
+    # caller session remains an audit/workspace label and must not be trusted
+    # as a quota key at authenticated API boundaries.
+    burn_principal_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.est_tokens is not None and self.est_tokens_in == 0 and self.est_tokens_out == 0:
@@ -87,6 +91,7 @@ class KnemonRouteDecision:
 
 
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+_LAST_RESERVATION_CLEANUP: dict[int, tuple[Any, datetime]] = {}
 _NAMED_PARAM_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 logger = logging.getLogger(__name__)
@@ -341,6 +346,68 @@ def _reservation_ttl_seconds() -> int:
     return max(1, configured)
 
 
+def _reservation_retention_seconds() -> int:
+    raw = os.getenv("MNEMOS_KNEMON_BURN_RESERVATION_RETENTION_SECONDS", "")
+    minimum = max(_reservation_ttl_seconds(), int(get_settings().knemon.session_burn_window_seconds))
+    try:
+        configured = int(raw) if raw.strip() else 7 * 24 * 60 * 60
+    except (TypeError, ValueError):
+        configured = 7 * 24 * 60 * 60
+    return max(minimum, configured)
+
+
+def _reservation_cleanup_interval_seconds() -> int:
+    raw = os.getenv("MNEMOS_KNEMON_BURN_RESERVATION_CLEANUP_INTERVAL_SECONDS", "")
+    try:
+        configured = int(raw) if raw.strip() else 300
+    except (TypeError, ValueError):
+        configured = 300
+    return max(1, configured)
+
+
+async def _cleanup_burn_reservations(backend: Any, *, now: datetime | None = None) -> None:
+    """Bound reservation history during normal routing traffic.
+
+    Cleanup is throttled per backend instance. Errors are deliberately visible
+    to the route caller, because silently failing retention would recreate the
+    unbounded-growth defect.
+    """
+    current = now or datetime.now(timezone.utc)
+    backend_key = id(backend)
+    previous_entry = _LAST_RESERVATION_CLEANUP.get(backend_key)
+    previous = previous_entry[1] if previous_entry is not None and previous_entry[0] is backend else None
+    if previous is not None and (
+        current - previous
+    ).total_seconds() < _reservation_cleanup_interval_seconds():
+        return
+    cutoff = current - timedelta(seconds=_reservation_retention_seconds())
+    async with backend.transactional() as tx:
+        conn = _conn_from_tx(tx)
+        deleted = await _tx_execute(
+            conn,
+            """
+            DELETE FROM knemon_burn_reservations
+            WHERE (status IN ('reconciled', 'released') AND reconciled_at < :cutoff_ts)
+               OR (status = 'pending' AND expires_at < :cutoff_ts)
+            """,
+            {"cutoff_ts": cutoff},
+        )
+        await _tx_execute(
+            conn,
+            """
+            DELETE FROM knemon_burn_sessions
+            WHERE touched_at < :cutoff_ts
+              AND NOT EXISTS (
+                SELECT 1 FROM knemon_burn_reservations reservations
+                WHERE reservations.session_id = knemon_burn_sessions.session_id
+              )
+            """,
+            {"cutoff_ts": cutoff},
+        )
+    _LAST_RESERVATION_CLEANUP[backend_key] = (backend, current)
+    logger.info("KNEMON burn reservation cleanup completed (deleted=%s)", deleted)
+
+
 def _is_burn_reservation_schema_missing(exc: Exception) -> bool:
     sqlstate = str(getattr(exc, "sqlstate", "") or getattr(exc, "pgcode", ""))
     errno = getattr(exc, "errno", None)
@@ -449,7 +516,16 @@ async def _reserve_session_burn(backend: Any, session_id: str | None) -> _BurnRe
     if _allow_nonatomic_burn_development():
         return _BurnReservation(None, None, await _session_burned(backend, session_id))
 
+    from mnemos.domain.knemon.migrations import ensure_knemon_schema
+
+    try:
+        await ensure_knemon_schema(backend)
+    except Exception as exc:
+        raise BurnReservationSchemaMissing(
+            f"KNEMON schema migration 0052_knemon_burn_reservations failed: {exc}"
+        ) from exc
     now = datetime.now(timezone.utc)
+    await _cleanup_burn_reservations(backend, now=now)
     since = now - timedelta(seconds=int(policy.session_burn_window_seconds))
     expires_at = now + timedelta(seconds=_reservation_ttl_seconds())
     reservation_id = str(uuid.uuid4())
@@ -503,7 +579,7 @@ async def _reserve_session_burn(backend: Any, session_id: str | None) -> _BurnRe
             return _BurnReservation(None, None, await _session_burned(backend, session_id))
         raise BurnReservationSchemaMissing(
             "KNEMON atomic burn reservation schema is missing; apply migration "
-            "0040_knemon_burn_reservations and restart. For development or a single-worker "
+            "0052_knemon_burn_reservations and restart. For development or a single-worker "
             "deployment only, set MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT=true "
             "to use legacy non-atomic accounting."
         ) from exc
@@ -1120,7 +1196,9 @@ async def _route_locked(
         raise NoModelAvailable("no model satisfies required capabilities, provider exclusions, and context window")
 
     rec_policy = recommendation_policy(req.task_kind)
-    reservation = reservation or await _reserve_session_burn(backend, req.caller_session_id)
+    reservation = reservation or await _reserve_session_burn(
+        backend, req.burn_principal_id or req.caller_session_id
+    )
     session_burned = reservation.burned
     effective_priority = _downgrade_priority(req.priority) if session_burned else req.priority
     priority_exempt_task = rec_policy.task_type in {"embedding", "routing"}
@@ -1309,10 +1387,11 @@ async def _route_locked(
 
 async def route(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDecision:
     """Route a request to a provider/model using KNEMON waterfall policy."""
-    if req.caller_session_id:
-        lock = _SESSION_LOCKS.setdefault(req.caller_session_id, asyncio.Lock())
+    burn_key = req.burn_principal_id or req.caller_session_id
+    if burn_key:
+        lock = _SESSION_LOCKS.setdefault(burn_key, asyncio.Lock())
         async with lock:
-            reservation = await _reserve_session_burn(backend, req.caller_session_id)
+            reservation = await _reserve_session_burn(backend, burn_key)
             try:
                 return await _route_locked(req, backend, reservation)
             except BaseException:

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import sys
 import sqlite3
+import sys
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from importlib.resources import files
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -537,12 +536,14 @@ async def test_ledger_endpoint_reconciles_explicit_route_reservation(monkeypatch
                 "outcome": "ok",
                 "caller_subsystem": "pantheon",
                 "tier": "standard",
+                "session_id": "client-rotated-label",
                 "reservation_id": reservation_id,
             },
         )
 
     assert response.status_code == 200
     assert response.json()["reconciled_reservation_ids"] == [reservation_id]
+    assert backend.records[0].session_id == "client-rotated-label"
     status, ledger_id = backend.conn.execute(
         "SELECT status, ledger_id FROM knemon_burn_reservations WHERE reservation_id = ?",
         (reservation_id,),
@@ -551,7 +552,7 @@ async def test_ledger_endpoint_reconciles_explicit_route_reservation(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_ledger_endpoint_fails_closed_when_reservation_schema_is_missing(monkeypatch):
+async def test_ledger_endpoint_migrates_missing_reservation_schema(monkeypatch):
     backend = _EndpointBackend()
     backend.conn.execute("DROP TABLE knemon_burn_reservations")
     backend.conn.commit()
@@ -577,18 +578,20 @@ async def test_ledger_endpoint_fails_closed_when_reservation_schema_is_missing(m
             },
         )
 
-    assert response.status_code == 503
-    assert "apply migration 0040_knemon_burn_reservations" in response.json()["detail"]
+    assert response.status_code == 200
+    assert backend.conn.execute(
+        "SELECT COUNT(*) FROM knemon_burn_sessions"
+    ).fetchone()[0] == 1
 
 
 def test_burn_reservation_migrations_cover_all_supported_backends():
-    root = Path(__file__).resolve().parent.parent
+    root = files("mnemos.domain.knemon.db_migrations")
     migrations = [
-        root / "db/migrations/0040_knemon_burn_reservations.sql",
-        root / "db/migrations_sqlite/0040_knemon_burn_reservations.sql",
-        root / "db/migrations_mariadb/0040_knemon_burn_reservations.sql",
-        root / "db/migrations_oracle/0040_knemon_burn_reservations.sql",
-        root / "db/migrations_db2/0040_knemon_burn_reservations.sql",
+        root / "migrations/0052_knemon_burn_reservations.sql",
+        root / "migrations_sqlite/0052_knemon_burn_reservations.sql",
+        root / "migrations_mariadb/0052_knemon_burn_reservations.sql",
+        root / "migrations_oracle/0052_knemon_burn_reservations.sql",
+        root / "migrations_db2/0052_knemon_burn_reservations.sql",
     ]
 
     for migration in migrations:
@@ -596,6 +599,7 @@ def test_burn_reservation_migrations_cover_all_supported_backends():
         assert "knemon_burn_sessions" in sql
         assert "knemon_burn_reservations" in sql
         assert "pending" in sql and "reconciled" in sql and "released" in sql
+        assert "retention" in sql
 
 
 def test_usage_ledger_migrations_preserve_constraint_parity():

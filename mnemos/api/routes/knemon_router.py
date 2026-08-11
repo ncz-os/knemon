@@ -34,19 +34,14 @@ async def route_knemon(
     user: UserContext = Depends(require_root),
 ):
     backend = backend_or_503()
-    # SECURITY (review #9): the per-session burn downgrade keys on
-    # caller_session_id, which the client controls — omitting it returned
-    # "not burned" and escaped the downgrade entirely. Anchor an omitted session
-    # to a stable, server-derived per-user id so dropping the session id no
-    # longer dodges the burn limit. (Full rotation-resistance also requires the
-    # ledger WRITE path to stamp this same server-derived session id.)
-    effective_session_id = caller_session_id or f"user:{user.user_id}"
+    enforcement_principal = f"user:{user.user_id}"
     req = KnemonRouteRequest(
         task_kind=task_kind,
         priority=priority,
         est_tokens_in=est_tokens_in,
         est_tokens_out=est_tokens_out,
-        caller_session_id=effective_session_id,
+        caller_session_id=caller_session_id,
+        burn_principal_id=enforcement_principal,
         caller_subsystem=caller_subsystem,
         exclude_providers=_csv(exclude_providers),
         require_capability=_csv(require_capability),
