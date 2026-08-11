@@ -17,9 +17,11 @@ from mnemos.api.extra_guards import require_extra
 from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.domain.knemon.router import (
     _asyncpg_sql,
+    _connection_dialect,
     _dict_rows,
     _is_mysql_connection,
     _mysql_sql,
+    _qmark_sql,
 )
 
 router = APIRouter(prefix="/v1/knemon", tags=["knemon"], dependencies=[require_extra("knemon", label="KNEMON")])
@@ -62,36 +64,100 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+async def _connection_rows(
+    conn: Any, sql: str, params: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    values = params or {}
+    fetch = getattr(conn, "fetch", None)
+    if callable(fetch):
+        pg_sql, pg_params = _asyncpg_sql(sql, values)
+        rows = _dict_rows(await _call(fetch, pg_sql, *pg_params))
+        return [
+            {name: _jsonable(await _materialize(value)) for name, value in row.items()}
+            for row in rows
+        ]
+    cursor = await _call(conn.cursor)
+    try:
+        if _is_mysql_connection(conn):
+            mysql_sql, mysql_params = _mysql_sql(sql, values)
+            await _call(cursor.execute, mysql_sql, tuple(mysql_params))
+        elif _connection_dialect(conn) == "db2":
+            db2_sql, db2_params = _qmark_sql(sql, values)
+            await _call(cursor.execute, db2_sql, tuple(db2_params))
+        else:
+            await _call(cursor.execute, sql, values)
+        fetched = await _call(cursor.fetchall)
+        names = [col[0].lower() for col in cursor.description]
+        out: list[dict[str, Any]] = []
+        for row in fetched or []:
+            item: dict[str, Any] = {}
+            for name, value in zip(names, row):
+                item[name] = _jsonable(await _materialize(value))
+            out.append(item)
+        return out
+    finally:
+        await _call(cursor.close)
+
+
 async def _rows(sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     backend = backend_or_503()
     async with backend.transactional() as tx:
+        return await _connection_rows(_conn_from_tx(tx), sql, params)
+
+
+async def _dialect_rows(sql_factory, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
         conn = _conn_from_tx(tx)
-        fetch = getattr(conn, "fetch", None)
-        if callable(fetch):
-            pg_sql, pg_params = _asyncpg_sql(sql, params or {})
-            rows = _dict_rows(await _call(fetch, pg_sql, *pg_params))
-            return [
-                {name: _jsonable(await _materialize(value)) for name, value in row.items()}
-                for row in rows
-            ]
-        cursor = await _call(conn.cursor)
-        try:
-            if _is_mysql_connection(conn):
-                mysql_sql, mysql_params = _mysql_sql(sql, params or {})
-                await _call(cursor.execute, mysql_sql, tuple(mysql_params))
-            else:
-                await _call(cursor.execute, sql, params or {})
-            fetched = await _call(cursor.fetchall)
-            names = [col[0].lower() for col in cursor.description]
-            out: list[dict[str, Any]] = []
-            for row in fetched or []:
-                item: dict[str, Any] = {}
-                for name, value in zip(names, row):
-                    item[name] = _jsonable(await _materialize(value))
-                out.append(item)
-            return out
-        finally:
-            await _call(cursor.close)
+        return await _connection_rows(conn, sql_factory(_connection_dialect(conn)), params)
+
+
+def _limited_sql(sql: str, dialect: str, limit: int) -> str:
+    """Apply a validated literal row bound using the target dialect's syntax."""
+    row_limit = max(1, int(limit))
+    clause = (
+        f"LIMIT {row_limit}"
+        if dialect in {"postgres", "sqlite", "mysql"}
+        else f"FETCH FIRST {row_limit} ROWS ONLY"
+    )
+    return f"{sql.rstrip()}\n{clause}"
+
+
+def _timeline_sql(dialect: str, bucket: str) -> str:
+    """Aggregate the bounded seven-day range into calendar buckets in SQL."""
+    if dialect == "sqlite":
+        parts = {
+            "bucket_year": "CAST(strftime('%Y', ts) AS INTEGER)",
+            "bucket_month": "CAST(strftime('%m', ts) AS INTEGER)",
+            "bucket_day": "CAST(strftime('%d', ts) AS INTEGER)",
+            "bucket_hour": "CAST(strftime('%H', ts) AS INTEGER)" if bucket == "1h" else "0",
+        }
+    else:
+        source = "ts"
+        if dialect == "postgres":
+            source = "ts AT TIME ZONE 'UTC'"
+        elif dialect == "oracle":
+            source = "SYS_EXTRACT_UTC(ts)"
+        parts = {
+            "bucket_year": f"EXTRACT(YEAR FROM {source})",
+            "bucket_month": f"EXTRACT(MONTH FROM {source})",
+            "bucket_day": f"EXTRACT(DAY FROM {source})",
+            "bucket_hour": f"EXTRACT(HOUR FROM {source})" if bucket == "1h" else "0",
+        }
+    selections = ",\n                   ".join(
+        f"{expression} AS {name}" for name, expression in parts.items()
+    )
+    groups = ", ".join(expression for expression in dict.fromkeys(parts.values()) if expression != "0")
+    return f"""
+            SELECT {selections},
+                   COUNT(*) AS row_count,
+                   COALESCE(SUM(est_cost_usd), 0) AS cost_usd
+            FROM usage_ledger
+            WHERE ts >= :since_ts
+              AND ts <= :until_ts
+            GROUP BY {groups}
+            ORDER BY {groups}
+            """
 
 
 async def _one(sql: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -188,8 +254,9 @@ async def by_provider(_: UserContext = Depends(require_root)):
 @router.get("/by_model")
 async def by_model(limit: int = Query(20, ge=1, le=200), _: UserContext = Depends(require_root)):
     async def load():
-        rows = await _rows(
-            """
+        return await _dialect_rows(
+            lambda dialect: _limited_sql(
+                """
             SELECT provider,
                    model,
                    COUNT(*) AS row_count,
@@ -199,9 +266,11 @@ async def by_model(limit: int = Query(20, ge=1, le=200), _: UserContext = Depend
             FROM usage_ledger
             GROUP BY provider, model
             ORDER BY cost_usd DESC, row_count DESC
-            """
+                """,
+                dialect,
+                limit,
+            )
         )
-        return rows[:limit]
 
     return await _cached(("by_model", limit), load)
 
@@ -243,33 +312,31 @@ async def by_task_kind(_: UserContext = Depends(require_root)):
 @router.get("/timeline")
 async def timeline(bucket: str = Query("1h", pattern="^(1h|1d)$"), _: UserContext = Depends(require_root)):
     async def load():
-        rows = await _rows(
-            """
-            SELECT ts, est_cost_usd
-            FROM usage_ledger
-            WHERE ts >= :since_ts
-            ORDER BY ts
-            """,
-            {"since_ts": datetime.now(timezone.utc) - timedelta(days=7)},
+        now = datetime.now(timezone.utc)
+        rows = await _dialect_rows(
+            lambda dialect: _timeline_sql(dialect, bucket),
+            {"since_ts": now - timedelta(days=7), "until_ts": now},
         )
-        grouped: dict[str, dict[str, Any]] = {}
+        grouped: list[dict[str, Any]] = []
         for row in rows:
-            value = row.get("ts")
-            if isinstance(value, str):
-                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if not isinstance(value, datetime):
+            try:
+                start = datetime(
+                    int(row["bucket_year"]),
+                    int(row["bucket_month"]),
+                    int(row["bucket_day"]),
+                    int(row["bucket_hour"]),
+                    tzinfo=timezone.utc,
+                )
+            except (KeyError, TypeError, ValueError):
                 continue
-            if value.tzinfo is None:
-                value = value.replace(tzinfo=timezone.utc)
-            value = value.astimezone(timezone.utc)
-            start = value.replace(minute=0, second=0, microsecond=0)
-            if bucket == "1d":
-                start = start.replace(hour=0)
-            key = _jsonable(start)
-            item = grouped.setdefault(key, {"ts_bucket": key, "row_count": 0, "cost_usd": 0.0})
-            item["row_count"] += 1
-            item["cost_usd"] += float(row.get("est_cost_usd") or 0)
-        return [grouped[key] for key in sorted(grouped)]
+            grouped.append(
+                {
+                    "ts_bucket": _jsonable(start),
+                    "row_count": int(row.get("row_count") or 0),
+                    "cost_usd": float(row.get("cost_usd") or 0),
+                }
+            )
+        return grouped
 
     return await _cached(("timeline", bucket), load)
 
@@ -277,8 +344,9 @@ async def timeline(bucket: str = Query("1h", pattern="^(1h|1d)$"), _: UserContex
 @router.get("/recent")
 async def recent(limit: int = Query(50, ge=1, le=500), _: UserContext = Depends(require_root)):
     async def load():
-        rows = await _rows(
-            """
+        return await _dialect_rows(
+            lambda dialect: _limited_sql(
+                """
             SELECT provider,
                    model,
                    tokens_in + tokens_out + tokens_reasoning AS tokens,
@@ -287,9 +355,11 @@ async def recent(limit: int = Query(50, ge=1, le=500), _: UserContext = Depends(
                    ts
             FROM usage_ledger
             ORDER BY ts DESC
-            """
+                """,
+                dialect,
+                limit,
+            )
         )
-        return rows[:limit]
 
     return await _cached(("recent", limit), load)
 
