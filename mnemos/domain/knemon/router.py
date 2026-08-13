@@ -9,10 +9,11 @@ import logging
 import os
 import re
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from mnemos.core.config import get_settings
 from mnemos.core.plan_windows import compute_plan_window_id
@@ -93,7 +94,13 @@ class KnemonRouteDecision:
     reservation_expires_at: str | None = None
 
 
-_SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+@dataclass
+class _SessionLockEntry:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
+_SESSION_LOCKS: dict[str, _SessionLockEntry] = {}
 _LAST_RESERVATION_CLEANUP: dict[int, tuple[Any, datetime]] = {}
 _NAMED_PARAM_RE = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -278,6 +285,31 @@ def _connection_dialect(conn: Any) -> str:
     if any(marker in identity for marker in ("oracle", "oracledb", "cx_oracle")):
         return "oracle"
     return "named"
+
+
+def _row_limited_sql(sql: str, dialect: str, limit: int) -> str:
+    """Apply a validated literal row limit for a supported database dialect."""
+    row_limit = max(1, int(limit))
+    clause = (
+        f"LIMIT {row_limit}"
+        if dialect in {"postgres", "sqlite", "mysql"}
+        else f"FETCH FIRST {row_limit} ROWS ONLY"
+    )
+    return f"{sql.rstrip()}\n{clause}"
+
+
+@asynccontextmanager
+async def _session_lock(key: str) -> AsyncIterator[None]:
+    """Serialize a session while retaining its lock only while it has users."""
+    entry = _SESSION_LOCKS.setdefault(key, _SessionLockEntry())
+    entry.users += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.users -= 1
+        if entry.users == 0 and _SESSION_LOCKS.get(key) is entry:
+            del _SESSION_LOCKS[key]
 
 
 async def _tx_execute(conn: Any, sql: str, params: dict[str, Any] | None = None) -> Any:
@@ -652,8 +684,10 @@ async def reconcile_burn_reservation(
             )
         selected_ids = [reservation_id]
     else:
-        rows = await _tx_rows(
-            conn,
+        row_limit = max(0, int(request_count))
+        if row_limit == 0:
+            return []
+        sql = _row_limited_sql(
             """
             SELECT reservation_id
             FROM knemon_burn_reservations
@@ -661,9 +695,15 @@ async def reconcile_burn_reservation(
               AND expires_at > :now_ts
             ORDER BY reserved_at, reservation_id
             """,
+            _connection_dialect(conn),
+            row_limit,
+        )
+        rows = await _tx_rows(
+            conn,
+            sql,
             {"session_id": session_id, "now_ts": now},
         )
-        selected_ids = [str(row["reservation_id"]) for row in rows[: max(0, int(request_count))]]
+        selected_ids = [str(row["reservation_id"]) for row in rows]
 
     for selected_id in selected_ids:
         await _tx_execute(
@@ -1067,8 +1107,7 @@ def _best_plan(
     return {"provider": provider, "plan_name": "api", "auth_method": "api", "path_kind": "api"}
 
 
-async def _usage_for_plan(backend: Any, plan: dict[str, Any]) -> tuple[int, int]:
-    now = datetime.now(timezone.utc)
+def _plan_usage_key(plan: dict[str, Any], now: datetime) -> tuple[str, str, str, str | None, str]:
     plan_name = str(plan.get("plan_name") or "api")
     provider = str(plan.get("provider") or "")
     path_kind, legacy_path_kind = _usage_path_kinds(plan)
@@ -1078,6 +1117,18 @@ async def _usage_for_plan(backend: Any, plan: dict[str, Any]) -> tuple[int, int]
         now,
         reset_anchor=str(plan.get("reset_anchor") or "monthly"),
         window_seconds=_to_int(plan.get("msg_window_seconds") or plan.get("token_window_seconds"), 0) or None,
+    )
+    return provider, plan_name, path_kind, legacy_path_kind, window_id
+
+
+async def _usage_for_plan(
+    backend: Any,
+    plan: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> tuple[int, int]:
+    provider, plan_name, path_kind, legacy_path_kind, window_id = _plan_usage_key(
+        plan, now or datetime.now(timezone.utc)
     )
     sql = """
         SELECT COALESCE(SUM(request_count), 0) AS requests_used,
@@ -1114,6 +1165,18 @@ async def _usage_for_plan(backend: Any, plan: dict[str, Any]) -> tuple[int, int]
         )
     row = rows[0] if rows else {}
     return _to_int(row.get("requests_used")), _to_int(row.get("tokens_used"))
+
+
+async def _usage_for_plan_cached(
+    backend: Any,
+    plan: dict[str, Any],
+    cache: dict[tuple[str, str, str, str | None, str], tuple[int, int]],
+) -> tuple[int, int]:
+    now = datetime.now(timezone.utc)
+    key = _plan_usage_key(plan, now)
+    if key not in cache:
+        cache[key] = await _usage_for_plan(backend, plan, now=now)
+    return cache[key]
 
 
 def _utilization(plan: dict[str, Any], requests_used: int, tokens_used: int) -> float:
@@ -1284,11 +1347,16 @@ async def _route_locked(
     selected: dict[str, Any] | None = None
     reasons: list[str] = []
     blocked_subscription_keys: set[tuple[str, str]] = set()
+    usage_by_plan: dict[tuple[str, str, str, str | None, str], tuple[int, int]] = {}
     for index, row in enumerate(candidates):
         plan = _best_plan(plans, row["provider"], worker_pools, row)
         auth_method = str(plan.get("auth_method") or "api").lower()
         path_kind = str(plan.get("path_kind") or auth_method).lower()
-        requests_used, tokens_used = await _usage_for_plan(backend, plan) if auth_method == "subscription" else (0, 0)
+        requests_used, tokens_used = (
+            await _usage_for_plan_cached(backend, plan, usage_by_plan)
+            if auth_method == "subscription"
+            else (0, 0)
+        )
         util = _utilization(plan, requests_used, tokens_used)
         item = {
             **row,
@@ -1365,7 +1433,7 @@ async def _route_locked(
             blocked_subscription_keys.add((row["provider"], row["model_id"]))
             continue
         if auth_method == "subscription":
-            requests_used, tokens_used = await _usage_for_plan(backend, plan)
+            requests_used, tokens_used = await _usage_for_plan_cached(backend, plan, usage_by_plan)
             util = _utilization(plan, requests_used, tokens_used)
         fallback_candidates.append(
             {
@@ -1413,8 +1481,7 @@ async def route(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDecision:
     """Route a request to a provider/model using KNEMON waterfall policy."""
     burn_key = req.burn_principal_id or req.caller_session_id
     if burn_key:
-        lock = _SESSION_LOCKS.setdefault(burn_key, asyncio.Lock())
-        async with lock:
+        async with _session_lock(burn_key):
             reservation = await _reserve_session_burn(backend, burn_key)
             try:
                 return await _route_locked(req, backend, reservation)

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from mnemos.api.routes import knemon_dashboard, knemon_utilization
-from mnemos.domain.knemon.router import _qmark_sql
+from mnemos.domain.knemon.router import _qmark_sql, _row_limited_sql
 
 
 class _AsyncpgConnection:
@@ -120,6 +120,43 @@ def test_dashboard_limit_is_applied_in_each_supported_database(dialect, clause):
     sql = knemon_dashboard._limited_sql("SELECT id FROM usage_ledger ORDER BY ts DESC", dialect, 50)
 
     assert sql.endswith(clause)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "clause"),
+    [
+        ("postgres", "LIMIT 50"),
+        ("sqlite", "LIMIT 50"),
+        ("mysql", "LIMIT 50"),
+        ("oracle", "FETCH FIRST 50 ROWS ONLY"),
+        ("db2", "FETCH FIRST 50 ROWS ONLY"),
+    ],
+)
+def test_reservation_reconciliation_limit_is_applied_for_each_database(dialect, clause):
+    sql = _row_limited_sql(
+        "SELECT reservation_id FROM knemon_burn_reservations ORDER BY reserved_at",
+        dialect,
+        50,
+    )
+
+    assert sql.endswith(clause)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_cache_is_lru_bounded_and_configurable(monkeypatch):
+    knemon_dashboard._CACHE.clear()
+    monkeypatch.setenv("MNEMOS_KNEMON_DASHBOARD_CACHE_MAX_ENTRIES", "2")
+
+    async def load(value):
+        return value
+
+    assert await knemon_dashboard._cached(("a",), lambda: load("a")) == "a"
+    assert await knemon_dashboard._cached(("b",), lambda: load("b")) == "b"
+    assert await knemon_dashboard._cached(("a",), lambda: load("new-a")) == "a"
+    assert await knemon_dashboard._cached(("c",), lambda: load("c")) == "c"
+
+    assert list(knemon_dashboard._CACHE) == [("a",), ("c",)]
+    knemon_dashboard._CACHE.clear()
 
 
 @pytest.mark.parametrize("dialect", ["postgres", "sqlite", "mysql", "oracle", "db2"])

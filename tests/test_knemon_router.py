@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+import mnemos.domain.knemon.router as knemon_router
 from mnemos.api.dependencies import UserContext
 from mnemos.api.routes import knemon_router as knemon_router_api
 from mnemos.core import config as config_mod
@@ -24,6 +25,7 @@ from mnemos.domain.knemon.router import (
     _cleanup_burn_reservations,
     _plans_by_provider,
     _reserve_session_burn,
+    _SESSION_LOCKS,
     _rows,
     _subscription_pool_aliases,
     _worker_pools_for_session,
@@ -574,6 +576,34 @@ async def test_parallel_same_session_burn_tracking_serializes():
     decisions = await asyncio.gather(*(route(_req(14, "burned-session"), backend) for _ in range(10)))
     assert {decision.provider for decision in decisions} == {"xai"}
     assert backend.max_active == 1
+    assert _SESSION_LOCKS == {}
+
+
+@pytest.mark.asyncio
+async def test_route_memoizes_subscription_usage_per_plan_for_fallbacks(monkeypatch):
+    backend = _SqliteKnemonBackend(40)
+    backend.conn.execute(
+        """
+        INSERT INTO model_registry VALUES
+          ('openai', 'gpt-sub-alt', 'GPT Sub Alt', '["chat","code"]',
+           2, 8, 200000, 1300, 0.90, 1, 0)
+        """
+    )
+    backend.conn.commit()
+    calls = 0
+    original = knemon_router._usage_for_plan
+
+    async def counted_usage(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(knemon_router, "_usage_for_plan", counted_usage)
+
+    decision = await route(_req(14), backend)
+
+    assert decision.provider == "openai"
+    assert calls == 1
 
 
 @pytest.mark.asyncio

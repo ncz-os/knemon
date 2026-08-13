@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import time
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -27,7 +29,8 @@ from mnemos.domain.knemon.router import (
 router = APIRouter(prefix="/v1/knemon", tags=["knemon"], dependencies=[require_extra("knemon", label="KNEMON")])
 
 _CACHE_TTL_SECONDS = 30  # 30s incremental refresh per task
-_CACHE: dict[tuple[Any, ...], tuple[float, Any]] = {}
+_CACHE: OrderedDict[tuple[Any, ...], tuple[float, Any]] = OrderedDict()
+_DEFAULT_CACHE_MAX_ENTRIES = 128
 
 _CAPABILITY_MAP = {
     "code_generation": ["coding"],
@@ -167,11 +170,28 @@ async def _one(sql: str, params: dict[str, Any] | None = None) -> dict[str, Any]
 
 async def _cached(key: tuple[Any, ...], loader):
     now = time.monotonic()
+    expired = [
+        cached_key
+        for cached_key, (created_at, _) in _CACHE.items()
+        if now - created_at >= _CACHE_TTL_SECONDS
+    ]
+    for cached_key in expired:
+        _CACHE.pop(cached_key, None)
     cached = _CACHE.get(key)
-    if cached and now - cached[0] < _CACHE_TTL_SECONDS:
+    if cached:
+        _CACHE.move_to_end(key)
         return cached[1]
     value = await loader()
-    _CACHE[key] = (now, value)
+    _CACHE[key] = (time.monotonic(), value)
+    _CACHE.move_to_end(key)
+    raw_limit = os.getenv("MNEMOS_KNEMON_DASHBOARD_CACHE_MAX_ENTRIES", "")
+    try:
+        max_entries = int(raw_limit) if raw_limit.strip() else _DEFAULT_CACHE_MAX_ENTRIES
+    except ValueError:
+        max_entries = _DEFAULT_CACHE_MAX_ENTRIES
+    max_entries = max(1, max_entries)
+    while len(_CACHE) > max_entries:
+        _CACHE.popitem(last=False)
     return value
 
 
