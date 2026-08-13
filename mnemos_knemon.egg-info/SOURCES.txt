@@ -11,10 +11,15 @@ mnemos/domain/knemon/migrations.py
 mnemos/domain/knemon/router.py
 mnemos/domain/knemon/db_migrations/__init__.py
 mnemos/domain/knemon/db_migrations/migrations/0052_knemon_burn_reservations.sql
+mnemos/domain/knemon/db_migrations/migrations/0053_knemon_ledger_principals.sql
 mnemos/domain/knemon/db_migrations/migrations_db2/0052_knemon_burn_reservations.sql
+mnemos/domain/knemon/db_migrations/migrations_db2/0053_knemon_ledger_principals.sql
 mnemos/domain/knemon/db_migrations/migrations_mariadb/0052_knemon_burn_reservations.sql
+mnemos/domain/knemon/db_migrations/migrations_mariadb/0053_knemon_ledger_principals.sql
 mnemos/domain/knemon/db_migrations/migrations_oracle/0052_knemon_burn_reservations.sql
+mnemos/domain/knemon/db_migrations/migrations_oracle/0053_knemon_ledger_principals.sql
 mnemos/domain/knemon/db_migrations/migrations_sqlite/0052_knemon_burn_reservations.sql
+mnemos/domain/knemon/db_migrations/migrations_sqlite/0053_knemon_ledger_principals.sql
 mnemos_knemon.egg-info/PKG-INFO
 mnemos_knemon.egg-info/SOURCES.txt
 mnemos_knemon.egg-info/dependency_links.txt
