@@ -18,16 +18,24 @@ def test_built_wheel_contains_every_knemon_migration(tmp_path: Path) -> None:
         build_root,
         ignore=shutil.ignore_patterns(".git", "build", "*.egg-info", "__pycache__", "*.pyc"),
     )
-    build_python = shutil.which("python") or sys.executable
+    # Build with the interpreter running the tests, not whatever `python`
+    # happens to be first on PATH -- picking that up meant the wheel was built
+    # by an unrelated toolchain whose setuptools could differ from the one this
+    # environment declares.
+    #
+    # Build isolation is deliberately LEFT ON so pip honours the
+    # [build-system] requires pin. Building with --no-build-isolation tests the
+    # ambient setuptools instead of the one the project actually requires, and
+    # this package declares a PEP 639 SPDX license string that needs
+    # setuptools>=77 to parse at all.
     subprocess.run(
         [
-            build_python,
+            sys.executable,
             "-m",
             "pip",
             "wheel",
             ".",
             "--no-deps",
-            "--no-build-isolation",
             "--wheel-dir",
             str(tmp_path),
         ],
