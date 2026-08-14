@@ -7,6 +7,6 @@ Maintainer-email: Jason Perlow <jperlow@gmail.com>
 License-Expression: Apache-2.0
 Requires-Python: >=3.11
 License-File: LICENSE
-Requires-Dist: mnemos-core
+Requires-Dist: mnemos-core<7,>=6.1
 Requires-Dist: fastapi
 Dynamic: license-file
