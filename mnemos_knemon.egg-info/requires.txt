@@ -1,2 +1,0 @@
-mnemos-core<7,>=6.1
-fastapi
