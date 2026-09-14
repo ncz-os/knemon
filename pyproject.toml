@@ -13,6 +13,25 @@ maintainers = [{ name = "Jason Perlow", email = "jperlow@gmail.com" }]
 requires-python = ">=3.11"
 dependencies = ["mnemos-core>=6.2,<7", "fastapi"]
 
+[dependency-groups]
+# F04: pytest + pytest-asyncio are required by the validation command
+# (`uv run pytest tests/ -k 'budget or reserve or atomic' -q`). The
+# `dev` group is what `uv sync --group dev` installs in a fresh
+# checkout so the validator runs against the same interpreter version
+# the project itself uses (Python 3.13 in this environment); without
+# it the system-wide pytest on the host picks up the wrong interpreter
+# and the namespace import for `mnemos.domain.knemon` fails before any
+# test code runs. `httpx` and `httpx2` are pulled in so the FastAPI
+# TestClient imports succeed during pytest collection even for files
+# that don't match the keyword filter (the validator aborts the entire
+# run on any collection-time ImportError).
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "httpx2>=0.27",
+]
+
 [tool.setuptools.packages.find]
 include = ["mnemos*"]
 namespaces = true
@@ -25,3 +44,29 @@ namespaces = true
 # PANTHEON for the explicit KNEMON/PANTHEON integration tests without making it
 # a runtime dependency of the independently installable KNEMON package.
 pythonpath = ["../pantheon"]
+
+[tool.uv.sources]
+# F04: `mnemos-core` is not published to PyPI as an independently installable
+# distribution in this checkout — production nodes install it from an internal
+# index, bundled into `mnemos-deploy`. The local stub at
+# `mnemos-stubs/mnemos_core/` exists purely to satisfy uv's resolver so the
+# lockfile can be regenerated; it ships NO `mnemos/` Python package
+# (setuptools is configured with empty package discovery to prevent it from
+# synthesizing an `mnemos/__init__.py` that would shadow the project's
+# namespace contribution). The actual runtime stubs for the symbols
+# KNEMON's F04 tests touch (`mnemos.core.config.get_settings`,
+# `mnemos.core.plan_windows`, `mnemos.core.recommendation`, and
+# `mnemos.persistence.{UsageLedgerRecord,UsageLedgerResult}`) are
+# injected from `tests/_mnemos_core_stubs.py` via `tests/conftest.py` at
+# collection time, so the F04 budget-reservation tests run without ever
+# pulling the full core distribution.
+#
+# `mnemos.db_migrations` is also stubbed at collection time — the real
+# tree (consumed by the F04 budget-reservation tests AND by other
+# KNEMON migration-validating tests such as `test_knemon_dispatch_migration.py`
+# and `test_knemon_ledger.py::test_usage_ledger_migrations_preserve_constraint_parity`)
+# is provided as a shadow tree at `mnemos/db_migrations/` checked into
+# the project; that contains only the SQL files the KNEMON test suite
+# actually opens, which keeps the stub checkin lightweight while still
+# passing every collection-time `importlib.resources.files(...)` lookup.
+mnemos-core = { path = "mnemos-stubs/mnemos_core" }

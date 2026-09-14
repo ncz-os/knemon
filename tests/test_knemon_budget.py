@@ -35,8 +35,23 @@ def _patch_spends(monkeypatch, *, total: float = 0.0, per_provider: dict | None 
     async def _prov(backend, *, provider, caller_subsystem="pantheon", now=None):
         return float(per_provider.get(provider.lower(), 0.0))
 
+    async def _pending(backend, *, caller_subsystem="pantheon", provider=None, now=None):
+        return 0.0
+
+    async def _effective(backend, *, caller_subsystem="pantheon", provider=None, now=None):
+        if provider:
+            return float(per_provider.get(provider.lower(), 0.0))
+        return float(total)
+
     monkeypatch.setattr(B, "weekly_spend_usd", _weekly)
     monkeypatch.setattr(B, "provider_spend_usd", _prov)
+    # F04: pending_reservations_usd and effective_spend_usd are the new
+    # pre-flight reads evaluate_usage_budget uses (pending reservations
+    # count against the live budget cap). The existing committed-spend
+    # tests still represent the "no callers have reserved yet" case —
+    # patch both so the pre-flight read returns the historical spend.
+    monkeypatch.setattr(B, "pending_reservations_usd", _pending)
+    monkeypatch.setattr(B, "effective_spend_usd", _effective)
 
 
 @pytest.mark.asyncio
