@@ -17,6 +17,11 @@ dist/
 # Local scratch files
 pytestdebug.log
 
+# Orchestrator / review artifacts
+TASK_F*.md
+zoder_run.log
+zoder_run_*.log
+
 # Editor / IDE
 .vscode/
 .idea/
