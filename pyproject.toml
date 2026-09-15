@@ -10,7 +10,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "MNEMOS Contributors" }]
 maintainers = [{ name = "Jason Perlow", email = "jperlow@gmail.com" }]
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = ["mnemos-core>=6.2,<7", "fastapi"]
 
 [dependency-groups]
@@ -46,27 +46,5 @@ namespaces = true
 pythonpath = ["../pantheon"]
 
 [tool.uv.sources]
-# F04: `mnemos-core` is not published to PyPI as an independently installable
-# distribution in this checkout — production nodes install it from an internal
-# index, bundled into `mnemos-deploy`. The local stub at
-# `mnemos-stubs/mnemos_core/` exists purely to satisfy uv's resolver so the
-# lockfile can be regenerated; it ships NO `mnemos/` Python package
-# (setuptools is configured with empty package discovery to prevent it from
-# synthesizing an `mnemos/__init__.py` that would shadow the project's
-# namespace contribution). The actual runtime stubs for the symbols
-# KNEMON's F04 tests touch (`mnemos.core.config.get_settings`,
-# `mnemos.core.plan_windows`, `mnemos.core.recommendation`, and
-# `mnemos.persistence.{UsageLedgerRecord,UsageLedgerResult}`) are
-# injected from `tests/_mnemos_core_stubs.py` via `tests/conftest.py` at
-# collection time, so the F04 budget-reservation tests run without ever
-# pulling the full core distribution.
-#
-# `mnemos.db_migrations` is also stubbed at collection time — the real
-# tree (consumed by the F04 budget-reservation tests AND by other
-# KNEMON migration-validating tests such as `test_knemon_dispatch_migration.py`
-# and `test_knemon_ledger.py::test_usage_ledger_migrations_preserve_constraint_parity`)
-# is provided as a shadow tree at `mnemos/db_migrations/` checked into
-# the project; that contains only the SQL files the KNEMON test suite
-# actually opens, which keeps the stub checkin lightweight while still
-# passing every collection-time `importlib.resources.files(...)` lookup.
-mnemos-core = { path = "mnemos-stubs/mnemos_core" }
+# Development source overlay; install the real canonical core sibling.
+mnemos-core = { path = "../mnemos-core", editable = true }

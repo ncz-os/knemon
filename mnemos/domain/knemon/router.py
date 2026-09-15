@@ -19,11 +19,15 @@ from mnemos.core.config import get_settings
 from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.core.recommendation import (
     _canonical_cap,
-    _capability_set as _rec_capability_set,
     _is_special_purpose,
     _preference_rank,
-    _tier_filter as _rec_tier_filter,
     recommendation_policy,
+)
+from mnemos.core.recommendation import (
+    _capability_set as _rec_capability_set,
+)
+from mnemos.core.recommendation import (
+    _tier_filter as _rec_tier_filter,
 )
 
 # Canonical provider identity — collapses historical/duplicate labels so a
@@ -62,7 +66,11 @@ class KnemonRouteRequest:
     burn_principal_id: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if self.est_tokens is not None and self.est_tokens_in == 0 and self.est_tokens_out == 0:
+        if (
+            self.est_tokens is not None
+            and self.est_tokens_in == 0
+            and self.est_tokens_out == 0
+        ):
             self.est_tokens_in = max(0, int(self.est_tokens))
 
 
@@ -121,6 +129,7 @@ class _BurnReservation:
     expires_at: datetime | None
     burned: bool
 
+
 # Caller-subsystem -> dispatchable provider allowlist (GRAEAE consult de8f4b2b 2026-05-28:
 # Option A centralized allowlist, config-driven/version-controlled, NoModelAvailable -> caller blocks).
 # A dispatch worker can only EXECUTE providers that have a gateway agent alias; KNEMON must never
@@ -128,11 +137,19 @@ class _BurnReservation:
 # zeroclaw stack per CLAUDE.md directive 5). openai is intentionally absent: it is reserved for the
 # explicit codex scarce path (kind=codex/review:/doctor:codex-fix), not the general dispatch route.
 CALLER_DISPATCHABLE_PROVIDERS: dict[str, frozenset[str]] = {
-    "zeroclaw": frozenset({"groq", "xai", "deepseek", "deepseek-direct", "nvidia", "together", "gemini"}),
+    "zeroclaw": frozenset(
+        {"groq", "xai", "deepseek", "deepseek-direct", "nvidia", "together", "gemini"}
+    ),
 }
 
 # Zeroclaw-family provider aliases — providers a zeroclaw worker can execute.
-_ZEROCLAW_PROVIDER_ALIASES = {"zeroclaw", "openclaw", "local", "local-llamacpp", "local-vllm"}
+_ZEROCLAW_PROVIDER_ALIASES = {
+    "zeroclaw",
+    "openclaw",
+    "local",
+    "local-llamacpp",
+    "local-vllm",
+}
 
 
 def _model_capability(provider: str, model_id: str) -> str:
@@ -156,8 +173,14 @@ def _dispatch_required_capabilities(
 ) -> list[str]:
     """Append the model-affinity capability for zeroclaw dispatch callers."""
     out = list(required_caps)
-    model_cap = _model_capability(str(selected.get("provider") or ""), str(selected.get("model_id") or ""))
-    if _dispatch_kind(str(selected.get("provider") or ""), caller_subsystem) == "zeroclaw" and model_cap not in out:
+    model_cap = _model_capability(
+        str(selected.get("provider") or ""), str(selected.get("model_id") or "")
+    )
+    if (
+        _dispatch_kind(str(selected.get("provider") or ""), caller_subsystem)
+        == "zeroclaw"
+        and model_cap not in out
+    ):
         out.append(model_cap)
     return out
 
@@ -230,7 +253,9 @@ def _qmark_sql(sql: str, params: dict[str, Any]) -> tuple[str, list[Any]]:
 
 def _is_mysql_connection(conn: Any) -> bool:
     identity = f"{type(conn).__module__}.{type(conn).__name__}".lower()
-    return any(marker in identity for marker in ("mysql", "mariadb", "aiomysql", "asyncmy"))
+    return any(
+        marker in identity for marker in ("mysql", "mariadb", "aiomysql", "asyncmy")
+    )
 
 
 def _dict_rows(rows: Any) -> list[dict[str, Any]]:
@@ -247,7 +272,9 @@ def _dict_rows(rows: Any) -> list[dict[str, Any]]:
     return out
 
 
-async def _rows(backend: Any, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+async def _rows(
+    backend: Any, sql: str, params: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     async with backend.transactional() as tx:
         conn = _conn_from_tx(tx)
         fetch = getattr(conn, "fetch", None)
@@ -265,7 +292,10 @@ async def _rows(backend: Any, sql: str, params: dict[str, Any] | None = None) ->
             fetched = await _call(cursor.fetchall)
             description = getattr(cursor, "description", None) or []
             names = [str(col[0]).lower() for col in description]
-            return [dict(zip(names, row)) for row in fetched or []]
+            return [
+                dict(row) if hasattr(row, "keys") else dict(zip(names, row))
+                for row in fetched or []
+            ]
         finally:
             close = getattr(cursor, "close", None)
             if close is not None:
@@ -338,7 +368,9 @@ async def _tx_execute(conn: Any, sql: str, params: dict[str, Any] | None = None)
             await _call(close)
 
 
-async def _tx_rows(conn: Any, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+async def _tx_rows(
+    conn: Any, sql: str, params: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     """Fetch rows without opening a second transaction."""
     values = params or {}
     fetch = getattr(conn, "fetch", None)
@@ -360,7 +392,10 @@ async def _tx_rows(conn: Any, sql: str, params: dict[str, Any] | None = None) ->
         fetched = await _call(cursor.fetchall)
         description = getattr(cursor, "description", None) or []
         names = [str(col[0]).lower() for col in description]
-        return [dict(zip(names, row)) for row in fetched or []]
+        return [
+            dict(row) if hasattr(row, "keys") else dict(zip(names, row))
+            for row in fetched or []
+        ]
     finally:
         close = getattr(cursor, "close", None)
         if close is not None:
@@ -368,14 +403,19 @@ async def _tx_rows(conn: Any, sql: str, params: dict[str, Any] | None = None) ->
 
 
 def _allow_nonatomic_burn_development() -> bool:
-    return os.getenv("MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT", "").strip().lower() in _TRUE_VALUES
+    return (
+        os.getenv("MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT", "").strip().lower()
+        in _TRUE_VALUES
+    )
 
 
 def _reservation_ttl_seconds() -> int:
     policy = get_settings().knemon
     raw = os.getenv("MNEMOS_KNEMON_BURN_RESERVATION_TTL_SECONDS", "")
     try:
-        configured = int(raw) if raw.strip() else int(policy.session_burn_window_seconds)
+        configured = (
+            int(raw) if raw.strip() else int(policy.session_burn_window_seconds)
+        )
     except (TypeError, ValueError):
         configured = int(policy.session_burn_window_seconds)
     return max(1, configured)
@@ -383,7 +423,10 @@ def _reservation_ttl_seconds() -> int:
 
 def _reservation_retention_seconds() -> int:
     raw = os.getenv("MNEMOS_KNEMON_BURN_RESERVATION_RETENTION_SECONDS", "")
-    minimum = max(_reservation_ttl_seconds(), int(get_settings().knemon.session_burn_window_seconds))
+    minimum = max(
+        _reservation_ttl_seconds(),
+        int(get_settings().knemon.session_burn_window_seconds),
+    )
     try:
         configured = int(raw) if raw.strip() else 7 * 24 * 60 * 60
     except (TypeError, ValueError):
@@ -400,7 +443,9 @@ def _reservation_cleanup_interval_seconds() -> int:
     return max(1, configured)
 
 
-async def _cleanup_burn_reservations(backend: Any, *, now: datetime | None = None) -> None:
+async def _cleanup_burn_reservations(
+    backend: Any, *, now: datetime | None = None
+) -> None:
     """Bound reservation history during normal routing traffic.
 
     Cleanup is throttled per backend instance. Errors are deliberately visible
@@ -410,10 +455,16 @@ async def _cleanup_burn_reservations(backend: Any, *, now: datetime | None = Non
     current = now or datetime.now(timezone.utc)
     backend_key = id(backend)
     previous_entry = _LAST_RESERVATION_CLEANUP.get(backend_key)
-    previous = previous_entry[1] if previous_entry is not None and previous_entry[0] is backend else None
-    if previous is not None and (
-        current - previous
-    ).total_seconds() < _reservation_cleanup_interval_seconds():
+    previous = (
+        previous_entry[1]
+        if previous_entry is not None and previous_entry[0] is backend
+        else None
+    )
+    if (
+        previous is not None
+        and (current - previous).total_seconds()
+        < _reservation_cleanup_interval_seconds()
+    ):
         return
     cutoff = current - timedelta(seconds=_reservation_retention_seconds())
     async with backend.transactional() as tx:
@@ -450,7 +501,11 @@ def _is_burn_reservation_schema_missing(exc: Exception) -> bool:
     message = str(exc).lower()
     table_named = any(
         table in message
-        for table in ("knemon_burn_sessions", "knemon_burn_reservations", "knemon_ledger_principals")
+        for table in (
+            "knemon_burn_sessions",
+            "knemon_burn_reservations",
+            "knemon_ledger_principals",
+        )
     )
     return (
         (sqlstate in {"42P01", "42704"} and table_named)
@@ -460,7 +515,13 @@ def _is_burn_reservation_schema_missing(exc: Exception) -> bool:
             table_named
             and any(
                 marker in message
-                for marker in ("no such table", "ora-00942", "does not exist", "sqlstate=42704", "sql0204n")
+                for marker in (
+                    "no such table",
+                    "ora-00942",
+                    "does not exist",
+                    "sqlstate=42704",
+                    "sql0204n",
+                )
             )
         )
     )
@@ -480,7 +541,9 @@ def _is_unique_violation(exc: Exception) -> bool:
     )
 
 
-async def _ensure_and_lock_burn_session(conn: Any, session_id: str, now: datetime) -> None:
+async def _ensure_and_lock_burn_session(
+    conn: Any, session_id: str, now: datetime
+) -> None:
     dialect = _connection_dialect(conn)
     params = {"session_id": session_id, "now_ts": now}
     if dialect == "postgres":
@@ -533,7 +596,8 @@ async def _ensure_and_lock_burn_session(conn: Any, session_id: str, now: datetim
     lock_suffix = "" if dialect == "sqlite" else " FOR UPDATE"
     await _tx_rows(
         conn,
-        "SELECT session_id FROM knemon_burn_sessions WHERE session_id = :session_id" + lock_suffix,
+        "SELECT session_id FROM knemon_burn_sessions WHERE session_id = :session_id"
+        + lock_suffix,
         {"session_id": session_id},
     )
     await _tx_execute(
@@ -543,7 +607,9 @@ async def _ensure_and_lock_burn_session(conn: Any, session_id: str, now: datetim
     )
 
 
-async def _reserve_session_burn(backend: Any, session_id: str | None) -> _BurnReservation:
+async def _reserve_session_burn(
+    backend: Any, session_id: str | None
+) -> _BurnReservation:
     """Atomically check session burn and reserve this routed request."""
     if not session_id:
         return _BurnReservation(None, None, False)
@@ -598,7 +664,11 @@ async def _reserve_session_burn(backend: Any, session_id: str | None) -> _BurnRe
                 {"session_id": session_id, "now_ts": now},
             )
             used = _to_int((ledger_rows[0] if ledger_rows else {}).get("requests_used"))
-            reserved = _to_int((reservation_rows[0] if reservation_rows else {}).get("requests_reserved"))
+            reserved = _to_int(
+                (reservation_rows[0] if reservation_rows else {}).get(
+                    "requests_reserved"
+                )
+            )
             await _tx_execute(
                 conn,
                 """
@@ -615,12 +685,16 @@ async def _reserve_session_burn(backend: Any, session_id: str | None) -> _BurnRe
                     "expires_at": expires_at,
                 },
             )
-        return _BurnReservation(reservation_id, expires_at, used + reserved >= threshold)
+        return _BurnReservation(
+            reservation_id, expires_at, used + reserved >= threshold
+        )
     except Exception as exc:
         if not _is_burn_reservation_schema_missing(exc):
             raise
         if _allow_nonatomic_burn_development():
-            return _BurnReservation(None, None, await _session_burned(backend, session_id))
+            return _BurnReservation(
+                None, None, await _session_burned(backend, session_id)
+            )
         raise BurnReservationSchemaMissing(
             "KNEMON atomic burn reservation schema is missing; apply migration "
             "0052_knemon_burn_reservations and 0053_knemon_ledger_principals, then restart. "
@@ -673,7 +747,9 @@ async def reconcile_burn_reservation(
         )
         row = rows[0] if rows else None
         if row is None:
-            raise BurnReservationConflict(f"burn reservation {reservation_id} was not found")
+            raise BurnReservationConflict(
+                f"burn reservation {reservation_id} was not found"
+            )
         if str(row.get("session_id")) != session_id:
             raise BurnReservationConflict(
                 f"burn reservation {reservation_id} belongs to session {row.get('session_id')!r}, not {session_id!r}"
@@ -792,18 +868,32 @@ def _normalize_capabilities(value: Any) -> set[str]:
         if isinstance(parsed, list):
             return {str(item).strip() for item in parsed if str(item).strip()}
         if isinstance(parsed, dict):
-            return {str(key).strip() for key, enabled in parsed.items() if enabled and str(key).strip()}
+            return {
+                str(key).strip()
+                for key, enabled in parsed.items()
+                if enabled and str(key).strip()
+            }
     except json.JSONDecodeError:
         pass
-    return {item.strip().strip('"').strip("'") for item in raw.strip("{}[]").split(",") if item.strip()}
+    return {
+        item.strip().strip('"').strip("'")
+        for item in raw.strip("{}[]").split(",")
+        if item.strip()
+    }
 
 
 def _normalize_pool(value: Any) -> str:
-    return "".join(ch if ch.isalnum() else "_" for ch in str(value or "").strip().lower()).strip("_")
+    return "".join(
+        ch if ch.isalnum() else "_" for ch in str(value or "").strip().lower()
+    ).strip("_")
 
 
 def _normalize_pools(value: Any) -> set[str]:
-    return {_normalize_pool(pool) for pool in _normalize_capabilities(value) if _normalize_pool(pool)}
+    return {
+        _normalize_pool(pool)
+        for pool in _normalize_capabilities(value)
+        if _normalize_pool(pool)
+    }
 
 
 def _subscription_pool_aliases(plan: dict[str, Any]) -> set[str]:
@@ -875,7 +965,9 @@ def _is_missing_worker_schema_error(exc: Exception) -> bool:
     )
 
 
-async def _worker_pools_for_session(backend: Any, session_id: str | None) -> set[str] | None:
+async def _worker_pools_for_session(
+    backend: Any, session_id: str | None
+) -> set[str] | None:
     if not session_id:
         return None
     rows: list[dict[str, Any]]
@@ -970,7 +1062,9 @@ def _price(row: dict[str, Any], tokens_in: int, tokens_out: int) -> float:
     )
 
 
-async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[dict[str, Any]]:
+async def _registry_candidates(
+    req: KnemonRouteRequest, backend: Any
+) -> list[dict[str, Any]]:
     rows = await _rows(
         backend,
         """
@@ -986,7 +1080,9 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
     # Deployment-default excludes (canonicalised) merged with per-request set.
     excluded = set(_csv_providers(providers_cfg.knemon_exclude_providers))
     excluded |= {_canon_provider(p) for p in req.exclude_providers if p.strip()}
-    allowed = CALLER_DISPATCHABLE_PROVIDERS.get((req.caller_subsystem or "").strip().lower())
+    allowed = CALLER_DISPATCHABLE_PROVIDERS.get(
+        (req.caller_subsystem or "").strip().lower()
+    )
     required = {cap.strip() for cap in req.require_capability if cap.strip()}
     min_context = int(max(0, req.est_tokens_in) * 1.2)
     candidates: list[dict[str, Any]] = []
@@ -998,7 +1094,9 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
         # backed by a gateway alias. Callers absent from the map (api, internal) are unrestricted.
         if allowed is not None and provider.lower() not in allowed:
             continue
-        if not _truthy(row.get("available", True)) or _truthy(row.get("deprecated", False)):
+        if not _truthy(row.get("available", True)) or _truthy(
+            row.get("deprecated", False)
+        ):
             continue
         if _to_int(row.get("context_window"), 0) < min_context:
             continue
@@ -1011,19 +1109,25 @@ async def _registry_candidates(req: KnemonRouteRequest, backend: Any) -> list[di
         enriched["tier"] = _tier(enriched)
         if not _tier_allowed(enriched["tier"], req.max_cost_tier):
             continue
-        enriched["estimated_cost_usd"] = _price(enriched, req.est_tokens_in, req.est_tokens_out)
+        enriched["estimated_cost_usd"] = _price(
+            enriched, req.est_tokens_in, req.est_tokens_out
+        )
         candidates.append(enriched)
     preference = _csv_providers(providers_cfg.knemon_provider_preference)
     if preference:
         rank = {name: idx for idx, name in enumerate(preference)}
         candidates.sort(
             key=lambda row: (
-                rank.get(_canon_provider(str(row.get("provider") or "")), len(preference)),
+                rank.get(
+                    _canon_provider(str(row.get("provider") or "")), len(preference)
+                ),
                 -_to_float(row.get("graeae_weight")),
             )
         )
     else:
-        candidates.sort(key=lambda row: _to_float(row.get("graeae_weight")), reverse=True)
+        candidates.sort(
+            key=lambda row: _to_float(row.get("graeae_weight")), reverse=True
+        )
     return candidates
 
 
@@ -1034,16 +1138,27 @@ def _apply_priority_ceiling(
     requested_priority: int | None = None,
 ) -> list[dict[str, Any]]:
     policy = get_settings().knemon
-    quality_priority = max(priority, requested_priority if requested_priority is not None else priority)
+    quality_priority = max(
+        priority, requested_priority if requested_priority is not None else priority
+    )
     if quality_priority >= 14:
         return [row for row in candidates if row["quality"] >= policy.g1_quality_floor]
     if priority >= 10:
-        return [row for row in candidates if row["tier"] in {"A", "B"} and row["quality"] >= policy.g2_quality_floor]
+        return [
+            row
+            for row in candidates
+            if row["tier"] in {"A", "B"} and row["quality"] >= policy.g2_quality_floor
+        ]
     eligible = [row for row in candidates if row["tier"] in {"A", "B"}]
-    return sorted(eligible, key=lambda row: (row["tier"] != "A", -_to_float(row.get("graeae_weight"))))
+    return sorted(
+        eligible,
+        key=lambda row: (row["tier"] != "A", -_to_float(row.get("graeae_weight"))),
+    )
 
 
-async def _plans_by_provider(backend: Any, as_of: date | None = None) -> dict[str, list[dict[str, Any]]]:
+async def _plans_by_provider(
+    backend: Any, as_of: date | None = None
+) -> dict[str, list[dict[str, Any]]]:
     sql = """
         SELECT provider, plan_name, auth_method, path_kind, monthly_usd, msg_cap,
                msg_window_seconds, token_cap, token_window_seconds,
@@ -1104,10 +1219,17 @@ def _best_plan(
                     if family in _subscription_pool_aliases(plan):
                         return plan
         return provider_plans[0]
-    return {"provider": provider, "plan_name": "api", "auth_method": "api", "path_kind": "api"}
+    return {
+        "provider": provider,
+        "plan_name": "api",
+        "auth_method": "api",
+        "path_kind": "api",
+    }
 
 
-def _plan_usage_key(plan: dict[str, Any], now: datetime) -> tuple[str, str, str, str | None, str]:
+def _plan_usage_key(
+    plan: dict[str, Any], now: datetime
+) -> tuple[str, str, str, str | None, str]:
     plan_name = str(plan.get("plan_name") or "api")
     provider = str(plan.get("provider") or "")
     path_kind, legacy_path_kind = _usage_path_kinds(plan)
@@ -1116,7 +1238,10 @@ def _plan_usage_key(plan: dict[str, Any], now: datetime) -> tuple[str, str, str,
         plan_name,
         now,
         reset_anchor=str(plan.get("reset_anchor") or "monthly"),
-        window_seconds=_to_int(plan.get("msg_window_seconds") or plan.get("token_window_seconds"), 0) or None,
+        window_seconds=_to_int(
+            plan.get("msg_window_seconds") or plan.get("token_window_seconds"), 0
+        )
+        or None,
     )
     return provider, plan_name, path_kind, legacy_path_kind, window_id
 
@@ -1192,7 +1317,9 @@ def _utilization(plan: dict[str, Any], requests_used: int, tokens_used: int) -> 
 def _usage_path_kinds(plan: dict[str, Any]) -> tuple[str, str | None]:
     path_kind = str(plan.get("path_kind") or "api").lower()
     auth_method = str(plan.get("auth_method") or "api").lower()
-    legacy_path_kind = "api" if auth_method == "subscription" and path_kind != "api" else None
+    legacy_path_kind = (
+        "api" if auth_method == "subscription" and path_kind != "api" else None
+    )
     return path_kind, legacy_path_kind
 
 
@@ -1203,7 +1330,9 @@ async def _session_burned(backend: Any, session_id: str | None) -> bool:
     threshold = policy.session_burn_requests_per_hour
     if threshold <= 0:
         return False
-    since = datetime.now(timezone.utc) - timedelta(seconds=policy.session_burn_window_seconds)
+    since = datetime.now(timezone.utc) - timedelta(
+        seconds=policy.session_burn_window_seconds
+    )
     if _allow_nonatomic_burn_development():
         sql = """
             SELECT COALESCE(SUM(request_count), 0) AS requests_used
@@ -1249,9 +1378,14 @@ def _fallback_bucket(item: dict[str, Any]) -> int:
     return 4
 
 
-def _fallback_chain(candidates: list[dict[str, Any]], selected: dict[str, Any]) -> list[tuple]:
+def _fallback_chain(
+    candidates: list[dict[str, Any]], selected: dict[str, Any]
+) -> list[tuple]:
     alternates = [
-        row for row in candidates if (row["provider"], row["model_id"]) != (selected["provider"], selected["model_id"])
+        row
+        for row in candidates
+        if (row["provider"], row["model_id"])
+        != (selected["provider"], selected["model_id"])
     ]
     alternates.sort(
         key=lambda row: (
@@ -1279,19 +1413,27 @@ async def _route_locked(
 ) -> KnemonRouteDecision:
     candidates = await _registry_candidates(req, backend)
     if not candidates:
-        raise NoModelAvailable("no model satisfies required capabilities, provider exclusions, and context window")
+        raise NoModelAvailable(
+            "no model satisfies required capabilities, provider exclusions, and context window"
+        )
 
     rec_policy = recommendation_policy(req.task_kind)
     reservation = reservation or await _reserve_session_burn(
         backend, req.burn_principal_id or req.caller_session_id
     )
     session_burned = reservation.burned
-    effective_priority = _downgrade_priority(req.priority) if session_burned else req.priority
+    effective_priority = (
+        _downgrade_priority(req.priority) if session_burned else req.priority
+    )
     priority_exempt_task = rec_policy.task_type in {"embedding", "routing"}
     if not priority_exempt_task:
-        candidates = _apply_priority_ceiling(candidates, effective_priority, requested_priority=req.priority)
+        candidates = _apply_priority_ceiling(
+            candidates, effective_priority, requested_priority=req.priority
+        )
         if not candidates:
-            raise NoModelAvailable("no model satisfies priority tier and quality constraints")
+            raise NoModelAvailable(
+                "no model satisfies priority tier and quality constraints"
+            )
 
     # ── Task-type capability filter (recommendation policy) ──────────────────
     # Narrow candidates by the task_kind's required/any/excluded capabilities,
@@ -1301,11 +1443,13 @@ async def _route_locked(
     # Canonicalise policy caps through the same alias table used for model
     # caps so that "code"→"coding" and CSVs match (router side of the
     # _caps_match fix in recommendation.py).
-    _task_required_caps: set[str] = {_canonical_cap(c) for c in rec_policy.required_caps} | {
-        _canonical_cap(cap.strip()) for cap in req.require_capability if cap.strip()
-    }
+    _task_required_caps: set[str] = {
+        _canonical_cap(c) for c in rec_policy.required_caps
+    } | {_canonical_cap(cap.strip()) for cap in req.require_capability if cap.strip()}
     _task_any_caps: set[str] = {_canonical_cap(c) for c in rec_policy.any_caps}
-    _task_excluded_caps: set[str] = {_canonical_cap(c) for c in rec_policy.excluded_caps}
+    _task_excluded_caps: set[str] = {
+        _canonical_cap(c) for c in rec_policy.excluded_caps
+    }
     _task_filtered: list[dict[str, Any]] = []
     for row in candidates:
         # Use the recommendation module's capability normalizer which
@@ -1382,12 +1526,22 @@ async def _route_locked(
                     f"{policy.subscription_preferred_utilization_pct:.0f}% utilization ({util:.2f}%)"
                 )
                 break
-            if not session_burned and util <= policy.subscription_near_cap_pct and effective_priority >= 12:
+            if (
+                not session_burned
+                and util <= policy.subscription_near_cap_pct
+                and effective_priority >= 12
+            ):
                 selected = item
-                reasons.append(f"selected subscription near cap for priority {effective_priority} ({util:.2f}%)")
+                reasons.append(
+                    f"selected subscription near cap for priority {effective_priority} ({util:.2f}%)"
+                )
                 break
             no_other_candidate = index == len(candidates) - 1
-            if util > policy.subscription_near_cap_pct and util < 100 and effective_priority >= 14:
+            if (
+                util > policy.subscription_near_cap_pct
+                and util < 100
+                and effective_priority >= 14
+            ):
                 selected = item
                 reasons.append(
                     "selected over-"
@@ -1410,15 +1564,23 @@ async def _route_locked(
             reasons.append("selected free plan for low-priority request")
             break
         if auth_method in {"api", "token"}:
-            if effective_priority < 10 and item["estimated_cost_usd"] >= policy.low_priority_api_cost_ceiling_usd:
-                reasons.append(f"skipped API cost ${item['estimated_cost_usd']:.4f} for low-priority request")
+            if (
+                effective_priority < 10
+                and item["estimated_cost_usd"]
+                >= policy.low_priority_api_cost_ceiling_usd
+            ):
+                reasons.append(
+                    f"skipped API cost ${item['estimated_cost_usd']:.4f} for low-priority request"
+                )
                 continue
             selected = item
             reasons.append(f"selected {auth_method} candidate")
             break
 
     if selected is None:
-        raise NoModelAvailable("no model survived subscription, free, and API waterfall rules")
+        raise NoModelAvailable(
+            "no model survived subscription, free, and API waterfall rules"
+        )
 
     seen = {(row["provider"], row["model_id"]) for row in enriched}
     fallback_candidates = list(enriched)
@@ -1433,7 +1595,9 @@ async def _route_locked(
             blocked_subscription_keys.add((row["provider"], row["model_id"]))
             continue
         if auth_method == "subscription":
-            requests_used, tokens_used = await _usage_for_plan_cached(backend, plan, usage_by_plan)
+            requests_used, tokens_used = await _usage_for_plan_cached(
+                backend, plan, usage_by_plan
+            )
             util = _utilization(plan, requests_used, tokens_used)
         fallback_candidates.append(
             {
@@ -1446,7 +1610,9 @@ async def _route_locked(
         )
     if blocked_subscription_keys:
         fallback_candidates = [
-            row for row in fallback_candidates if (row["provider"], row["model_id"]) not in blocked_subscription_keys
+            row
+            for row in fallback_candidates
+            if (row["provider"], row["model_id"]) not in blocked_subscription_keys
         ]
     return KnemonRouteDecision(
         provider=selected["provider"],
@@ -1466,14 +1632,21 @@ async def _route_locked(
         dispatch_cost_tier=str(selected.get("tier") or ""),
         dispatch_subscription_pools=(
             sorted(
-                _subscription_pool_aliases({"provider": selected["provider"], "plan_name": selected.get("plan_name")})
+                _subscription_pool_aliases(
+                    {
+                        "provider": selected["provider"],
+                        "plan_name": selected.get("plan_name"),
+                    }
+                )
             )
             if selected.get("auth_method") == "subscription"
             else []
         ),
         plan_name=str(selected.get("plan_name") or "api"),
         reservation_id=reservation.reservation_id,
-        reservation_expires_at=(reservation.expires_at.isoformat() if reservation.expires_at else None),
+        reservation_expires_at=(
+            reservation.expires_at.isoformat() if reservation.expires_at else None
+        ),
     )
 
 
@@ -1487,8 +1660,12 @@ async def route(req: KnemonRouteRequest, backend: Any) -> KnemonRouteDecision:
                 return await _route_locked(req, backend, reservation)
             except BaseException:
                 try:
-                    await asyncio.shield(_release_burn_reservation(backend, reservation.reservation_id))
+                    await asyncio.shield(
+                        _release_burn_reservation(backend, reservation.reservation_id)
+                    )
                 except Exception:
-                    logger.exception("failed to release KNEMON burn reservation after routing failure")
+                    logger.exception(
+                        "failed to release KNEMON burn reservation after routing failure"
+                    )
                 raise
     return await _route_locked(req, backend)

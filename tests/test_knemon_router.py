@@ -6,26 +6,25 @@ import sqlite3
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 
-import pytest
-
 import mnemos.domain.knemon.router as knemon_router
+import pytest
 from mnemos.api.dependencies import UserContext
 from mnemos.api.routes import knemon_router as knemon_router_api
 from mnemos.core import config as config_mod
 from mnemos.core.config import get_settings
 from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.domain.knemon.router import (
+    _LAST_RESERVATION_CLEANUP,
+    _SESSION_LOCKS,
     KnemonRouteRequest,
     NoModelAvailable,
     _apply_priority_ceiling,
     _best_plan,
+    _cleanup_burn_reservations,
     _fallback_bucket,
     _plan_is_effective,
-    _LAST_RESERVATION_CLEANUP,
-    _cleanup_burn_reservations,
     _plans_by_provider,
     _reserve_session_burn,
-    _SESSION_LOCKS,
     _rows,
     _subscription_pool_aliases,
     _worker_pools_for_session,
@@ -235,14 +234,20 @@ class _SqliteKnemonBackend:
             )
         if agent_session_id or burned_session:
             effective_agent_session = agent_session_id or burned_session
-            effective_pools = subscription_pools if agent_session_id else ["chatgpt_plus"]
+            effective_pools = (
+                subscription_pools if agent_session_id else ["chatgpt_plus"]
+            )
             self.conn.execute(
                 """
                 INSERT INTO agents (
                   urn, kind, host, session_id, last_heartbeat, status, subscription_pools
                 ) VALUES ('urn:agent:test:1', 'codex', 'pytest', ?, ?, 'online', ?)
                 """,
-                (effective_agent_session, now.timestamp(), json.dumps(effective_pools or [])),
+                (
+                    effective_agent_session,
+                    now.timestamp(),
+                    json.dumps(effective_pools or []),
+                ),
             )
         self.conn.commit()
 
@@ -345,8 +350,18 @@ async def test_fallback_chain_uses_actual_utilization_for_unvisited_subscription
 
 def test_fallback_bucket_boundaries():
     assert _fallback_bucket({"auth_method": "free"}) == 0
-    assert _fallback_bucket({"auth_method": "subscription", "sub_window_utilization_pct": 69.99}) == 1
-    assert _fallback_bucket({"auth_method": "subscription", "sub_window_utilization_pct": 70.0}) == 4
+    assert (
+        _fallback_bucket(
+            {"auth_method": "subscription", "sub_window_utilization_pct": 69.99}
+        )
+        == 1
+    )
+    assert (
+        _fallback_bucket(
+            {"auth_method": "subscription", "sub_window_utilization_pct": 70.0}
+        )
+        == 4
+    )
     assert _fallback_bucket({"auth_method": "api", "estimated_cost_usd": 0.499999}) == 2
     assert _fallback_bucket({"auth_method": "api", "estimated_cost_usd": 0.50}) == 3
 
@@ -357,7 +372,9 @@ def test_g1_quality_floor_survives_burn_downgrade():
         {"quality": 0.86, "tier": "A", "graeae_weight": 0.80},
     ]
 
-    assert _apply_priority_ceiling(candidates, 13, requested_priority=14) == [candidates[1]]
+    assert _apply_priority_ceiling(candidates, 13, requested_priority=14) == [
+        candidates[1]
+    ]
 
 
 def test_best_plan_prefers_matching_workspace_pool_over_highest_price():
@@ -382,7 +399,10 @@ def test_best_plan_prefers_matching_workspace_pool_over_highest_price():
     }
 
     assert _best_plan(plans, "openai", {"chatgpt_plus"})["plan_name"] == "chatgpt_plus"
-    assert _best_plan(plans, "openai", {"chatgpt_pro"})["plan_name"] == "chatgpt_pro_200_codex"
+    assert (
+        _best_plan(plans, "openai", {"chatgpt_pro"})["plan_name"]
+        == "chatgpt_pro_200_codex"
+    )
     assert _best_plan(plans, "openai")["plan_name"] == "chatgpt_pro_200_codex"
 
 
@@ -440,7 +460,9 @@ async def test_max_cost_tier_cap_rejects_higher_tier_candidates():
 @pytest.mark.asyncio
 async def test_subscription_requires_caller_workspace_pool():
     session_id = "workspace-without-openai"
-    backend = _SqliteKnemonBackend(40, agent_session_id=session_id, subscription_pools=["anthropic_subscription"])
+    backend = _SqliteKnemonBackend(
+        40, agent_session_id=session_id, subscription_pools=["anthropic_subscription"]
+    )
     decision = await route(_req(14, session_id), backend)
     assert decision.provider == "xai"
     assert decision.auth_method == "api"
@@ -526,7 +548,9 @@ async def test_mysql_rows_convert_named_parameters_to_positional():
 @pytest.mark.asyncio
 async def test_subscription_allows_matching_caller_workspace_pool():
     session_id = "workspace-with-openai"
-    backend = _SqliteKnemonBackend(40, agent_session_id=session_id, subscription_pools=["chatgpt_plus"])
+    backend = _SqliteKnemonBackend(
+        40, agent_session_id=session_id, subscription_pools=["chatgpt_plus"]
+    )
     decision = await route(_req(14, session_id), backend)
     assert decision.provider == "openai"
     assert decision.auth_method == "subscription"
@@ -535,7 +559,9 @@ async def test_subscription_allows_matching_caller_workspace_pool():
 @pytest.mark.asyncio
 async def test_subscription_plan_selection_respects_exact_workspace_pool():
     session_id = "workspace-with-plus-only"
-    backend = _SqliteKnemonBackend(40, agent_session_id=session_id, subscription_pools=["chatgpt_plus"])
+    backend = _SqliteKnemonBackend(
+        40, agent_session_id=session_id, subscription_pools=["chatgpt_plus"]
+    )
     backend.conn.execute(
         """
         INSERT INTO subscription_plans VALUES
@@ -573,7 +599,9 @@ async def test_openai_no_workspace_pool_uses_chatgpt_family_for_generic_gpt_mode
 @pytest.mark.asyncio
 async def test_parallel_same_session_burn_tracking_serializes():
     backend = _SqliteKnemonBackend(92, burned_session="burned-session")
-    decisions = await asyncio.gather(*(route(_req(14, "burned-session"), backend) for _ in range(10)))
+    decisions = await asyncio.gather(
+        *(route(_req(14, "burned-session"), backend) for _ in range(10))
+    )
     assert {decision.provider for decision in decisions} == {"xai"}
     assert backend.max_active == 1
     assert _SESSION_LOCKS == {}
@@ -609,9 +637,13 @@ async def test_route_memoizes_subscription_usage_per_plan_for_fallbacks(monkeypa
 @pytest.mark.asyncio
 async def test_pending_route_reservation_closes_burn_threshold_race():
     session_id = "reservation-boundary"
-    backend = _SqliteKnemonBackend(92, burned_session=session_id, burned_request_count=9)
+    backend = _SqliteKnemonBackend(
+        92, burned_session=session_id, burned_request_count=9
+    )
 
-    decisions = await asyncio.gather(*(route(_req(14, session_id), backend) for _ in range(10)))
+    decisions = await asyncio.gather(
+        *(route(_req(14, session_id), backend) for _ in range(10))
+    )
 
     assert [decision.provider for decision in decisions].count("openai") == 1
     assert [decision.provider for decision in decisions].count("xai") == 9
@@ -636,6 +668,7 @@ async def test_reservations_are_shared_across_backend_instances(tmp_path):
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               ts TIMESTAMP NOT NULL,
               session_id TEXT,
+              caller_subsystem TEXT,
               request_count INTEGER NOT NULL
         );
         CREATE TABLE knemon_burn_sessions (
@@ -655,7 +688,7 @@ async def test_reservations_are_shared_across_backend_instances(tmp_path):
         """
     )
     setup.execute(
-            "INSERT INTO usage_ledger (ts, session_id, request_count) VALUES (?, 'shared-session', 9)",
+        "INSERT INTO usage_ledger (ts, session_id, request_count) VALUES (?, 'shared-session', 9)",
         (datetime.now(timezone.utc),),
     )
     setup.commit()
@@ -687,7 +720,9 @@ async def test_reservations_are_shared_across_backend_instances(tmp_path):
 @pytest.mark.asyncio
 async def test_failed_route_releases_its_reservation():
     session_id = "no-model-release"
-    backend = _SqliteKnemonBackend(40, agent_session_id=session_id, subscription_pools=["chatgpt_plus"])
+    backend = _SqliteKnemonBackend(
+        40, agent_session_id=session_id, subscription_pools=["chatgpt_plus"]
+    )
     backend.conn.execute("DELETE FROM model_registry")
     backend.conn.commit()
 
@@ -704,19 +739,28 @@ async def test_failed_route_releases_its_reservation():
 @pytest.mark.asyncio
 async def test_missing_reservation_schema_is_migrated_before_default_route():
     backend = _SqliteKnemonBackend(40)
-    usage_rows_before = backend.conn.execute("SELECT COUNT(*) FROM usage_ledger").fetchone()[0]
+    usage_rows_before = backend.conn.execute(
+        "SELECT COUNT(*) FROM usage_ledger"
+    ).fetchone()[0]
     backend.conn.execute("DROP TABLE knemon_burn_reservations")
     backend.conn.commit()
 
     decision = await route(_req(14, "migration-required"), backend)
 
     assert decision.reservation_id is not None
-    assert backend.conn.execute(
-        "SELECT COUNT(*) FROM knemon_burn_reservations"
-    ).fetchone()[0] == 1
-    assert backend.conn.execute("SELECT COUNT(*) FROM usage_ledger").fetchone()[0] == usage_rows_before
+    assert (
+        backend.conn.execute(
+            "SELECT COUNT(*) FROM knemon_burn_reservations"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        backend.conn.execute("SELECT COUNT(*) FROM usage_ledger").fetchone()[0]
+        == usage_rows_before
+    )
     indexes = {
-        row[1] for row in backend.conn.execute("PRAGMA index_list(knemon_burn_reservations)")
+        row[1]
+        for row in backend.conn.execute("PRAGMA index_list(knemon_burn_reservations)")
     }
     assert "idx_knemon_burn_reservations_retention" in indexes
 
@@ -727,8 +771,12 @@ async def test_reservation_cleanup_removes_only_rows_past_retention(monkeypatch)
     now = datetime.now(timezone.utc)
     old = now - timedelta(days=8)
     recent = now - timedelta(days=1)
-    backend.conn.execute("INSERT OR IGNORE INTO knemon_burn_sessions VALUES ('old', ?)", (old,))
-    backend.conn.execute("INSERT OR IGNORE INTO knemon_burn_sessions VALUES ('recent', ?)", (recent,))
+    backend.conn.execute(
+        "INSERT OR IGNORE INTO knemon_burn_sessions VALUES ('old', ?)", (old,)
+    )
+    backend.conn.execute(
+        "INSERT OR IGNORE INTO knemon_burn_sessions VALUES ('recent', ?)", (recent,)
+    )
     backend.conn.executemany(
         """
         INSERT INTO knemon_burn_reservations (
@@ -743,7 +791,9 @@ async def test_reservation_cleanup_removes_only_rows_past_retention(monkeypatch)
     )
     backend.conn.commit()
     _LAST_RESERVATION_CLEANUP.pop(id(backend), None)
-    monkeypatch.setenv("MNEMOS_KNEMON_BURN_RESERVATION_RETENTION_SECONDS", str(7 * 86400))
+    monkeypatch.setenv(
+        "MNEMOS_KNEMON_BURN_RESERVATION_RETENTION_SECONDS", str(7 * 86400)
+    )
 
     await _cleanup_burn_reservations(backend, now=now)
 
@@ -754,7 +804,9 @@ async def test_reservation_cleanup_removes_only_rows_past_retention(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_api_session_rotation_does_not_rotate_burn_principal(monkeypatch):
-    backend = _SqliteKnemonBackend(92, burned_session="user:root", burned_request_count=10)
+    backend = _SqliteKnemonBackend(
+        92, burned_session="user:root", burned_request_count=10
+    )
     now = datetime.now(timezone.utc).timestamp()
     backend.conn.executemany(
         """
@@ -766,7 +818,11 @@ async def test_api_session_rotation_does_not_rotate_burn_principal(monkeypatch):
     backend.conn.commit()
     monkeypatch.setattr(knemon_router_api, "backend_or_503", lambda: backend)
     root = UserContext(
-        user_id="root", group_ids=[], role="root", namespace="default", authenticated=True
+        user_id="root",
+        group_ids=[],
+        role="root",
+        namespace="default",
+        authenticated=True,
     )
 
     decisions = []
@@ -808,7 +864,9 @@ async def test_missing_reservation_schema_has_explicit_development_opt_out(monke
 @pytest.mark.asyncio
 async def test_burned_g1_session_loses_near_cap_subscription_lane():
     session_id = "burned-near-cap"
-    backend = _SqliteKnemonBackend(70, burned_session=session_id, burned_request_count=10)
+    backend = _SqliteKnemonBackend(
+        70, burned_session=session_id, burned_request_count=10
+    )
     decision = await route(_req(14, session_id), backend)
 
     assert decision.provider == "xai"
@@ -824,9 +882,13 @@ async def test_burned_g1_session_loses_near_cap_subscription_lane():
     ],
 )
 @pytest.mark.asyncio
-async def test_session_burn_threshold_defaults_to_ten_requests(request_count, expected_provider):
+async def test_session_burn_threshold_defaults_to_ten_requests(
+    request_count, expected_provider
+):
     session_id = f"burn-boundary-{request_count}"
-    backend = _SqliteKnemonBackend(92, burned_session=session_id, burned_request_count=request_count)
+    backend = _SqliteKnemonBackend(
+        92, burned_session=session_id, burned_request_count=request_count
+    )
     decision = await route(_req(14, session_id), backend)
     assert decision.provider == expected_provider
 
@@ -847,7 +909,9 @@ async def test_session_burn_ignores_requests_outside_rolling_window():
 @pytest.mark.asyncio
 async def test_session_burn_threshold_is_configurable(monkeypatch):
     session_id = "burn-configurable"
-    backend = _SqliteKnemonBackend(92, burned_session=session_id, burned_request_count=10)
+    backend = _SqliteKnemonBackend(
+        92, burned_session=session_id, burned_request_count=10
+    )
     monkeypatch.setattr(get_settings().knemon, "session_burn_requests_per_hour", 11)
     decision = await route(_req(14, session_id), backend)
     assert decision.provider == "openai"
@@ -865,9 +929,15 @@ async def test_session_burn_threshold_is_configurable(monkeypatch):
         ({"auth_method": "oauth"}, 4),
     ],
 )
-def test_fallback_bucket_order_and_strict_boundaries(monkeypatch, item, expected_bucket):
-    monkeypatch.setattr(get_settings().knemon, "low_priority_api_cost_ceiling_usd", 0.50)
-    monkeypatch.setattr(get_settings().knemon, "subscription_preferred_utilization_pct", 70.0)
+def test_fallback_bucket_order_and_strict_boundaries(
+    monkeypatch, item, expected_bucket
+):
+    monkeypatch.setattr(
+        get_settings().knemon, "low_priority_api_cost_ceiling_usd", 0.50
+    )
+    monkeypatch.setattr(
+        get_settings().knemon, "subscription_preferred_utilization_pct", 70.0
+    )
     assert _fallback_bucket(item) == expected_bucket
 
 
@@ -916,8 +986,12 @@ async def test_fallback_chain_checks_subscription_utilization_for_unevaluated_ca
 
 
 def test_openai_subscription_aliases_split_chatgpt_and_codex():
-    chatgpt_aliases = _subscription_pool_aliases({"provider": "openai", "plan_name": "chatgpt_plus"})
-    codex_aliases = _subscription_pool_aliases({"provider": "openai", "plan_name": "codex_plus"})
+    chatgpt_aliases = _subscription_pool_aliases(
+        {"provider": "openai", "plan_name": "chatgpt_plus"}
+    )
+    codex_aliases = _subscription_pool_aliases(
+        {"provider": "openai", "plan_name": "codex_plus"}
+    )
 
     assert "openai_subscription" in chatgpt_aliases
     assert "chatgpt_subscription" in chatgpt_aliases
@@ -930,45 +1004,103 @@ def test_openai_subscription_aliases_split_chatgpt_and_codex():
 def test_best_plan_honors_chatgpt_and_codex_workspace_pools():
     plans = {
         "openai": [
-            {"provider": "openai", "plan_name": "chatgpt_pro", "auth_method": "subscription"},
-            {"provider": "openai", "plan_name": "chatgpt_pro_100", "auth_method": "subscription"},
+            {
+                "provider": "openai",
+                "plan_name": "chatgpt_pro",
+                "auth_method": "subscription",
+            },
+            {
+                "provider": "openai",
+                "plan_name": "chatgpt_pro_100",
+                "auth_method": "subscription",
+            },
             {
                 "provider": "openai",
                 "plan_name": "codex_pro_200_20x",
                 "auth_method": "subscription",
                 "parent_plan_id": "codex_pro_200",
             },
-            {"provider": "openai", "plan_name": "codex_plus", "auth_method": "subscription"},
+            {
+                "provider": "openai",
+                "plan_name": "codex_plus",
+                "auth_method": "subscription",
+            },
         ]
     }
 
-    assert _best_plan(plans, "openai", {"chatgpt_pro_100"})["plan_name"] == "chatgpt_pro_100"
-    assert _best_plan(plans, "openai", {"chatgpt_subscription"})["plan_name"] == "chatgpt_pro"
-    assert _best_plan(plans, "openai", {"codex_subscription"})["plan_name"] == "codex_pro_200_20x"
-    assert _best_plan(plans, "openai", {"codex_pro_200"})["plan_name"] == "codex_pro_200_20x"
+    assert (
+        _best_plan(plans, "openai", {"chatgpt_pro_100"})["plan_name"]
+        == "chatgpt_pro_100"
+    )
+    assert (
+        _best_plan(plans, "openai", {"chatgpt_subscription"})["plan_name"]
+        == "chatgpt_pro"
+    )
+    assert (
+        _best_plan(plans, "openai", {"codex_subscription"})["plan_name"]
+        == "codex_pro_200_20x"
+    )
+    assert (
+        _best_plan(plans, "openai", {"codex_pro_200"})["plan_name"]
+        == "codex_pro_200_20x"
+    )
     assert _best_plan(plans, "openai", {"codex_plus"})["plan_name"] == "codex_plus"
 
 
 def test_best_plan_infers_openai_family_without_workspace_pool():
     plans = {
         "openai": [
-            {"provider": "openai", "plan_name": "codex_pro_200_20x", "auth_method": "subscription"},
-            {"provider": "openai", "plan_name": "chatgpt_pro", "auth_method": "subscription"},
+            {
+                "provider": "openai",
+                "plan_name": "codex_pro_200_20x",
+                "auth_method": "subscription",
+            },
+            {
+                "provider": "openai",
+                "plan_name": "chatgpt_pro",
+                "auth_method": "subscription",
+            },
         ]
     }
 
-    chatgpt_candidate = {"provider": "openai", "model_id": "gpt-5.5", "display_name": "GPT-5.5"}
-    codex_candidate = {"provider": "openai", "model_id": "gpt-5.3-codex", "display_name": "GPT-5.3 Codex"}
+    chatgpt_candidate = {
+        "provider": "openai",
+        "model_id": "gpt-5.5",
+        "display_name": "GPT-5.5",
+    }
+    codex_candidate = {
+        "provider": "openai",
+        "model_id": "gpt-5.3-codex",
+        "display_name": "GPT-5.3 Codex",
+    }
 
-    assert _best_plan(plans, "openai", candidate=chatgpt_candidate)["plan_name"] == "chatgpt_pro"
-    assert _best_plan(plans, "openai", candidate=codex_candidate)["plan_name"] == "codex_pro_200_20x"
+    assert (
+        _best_plan(plans, "openai", candidate=chatgpt_candidate)["plan_name"]
+        == "chatgpt_pro"
+    )
+    assert (
+        _best_plan(plans, "openai", candidate=codex_candidate)["plan_name"]
+        == "codex_pro_200_20x"
+    )
 
 
 def test_g1_priority_quality_floor_boundary(monkeypatch):
     monkeypatch.setattr(get_settings().knemon, "g1_quality_floor", 0.85)
     candidates = [
-        {"provider": "cheap", "model_id": "below", "quality": 0.8499, "tier": "A", "graeae_weight": 0.99},
-        {"provider": "good", "model_id": "at-floor", "quality": 0.85, "tier": "B", "graeae_weight": 0.75},
+        {
+            "provider": "cheap",
+            "model_id": "below",
+            "quality": 0.8499,
+            "tier": "A",
+            "graeae_weight": 0.99,
+        },
+        {
+            "provider": "good",
+            "model_id": "at-floor",
+            "quality": 0.85,
+            "tier": "B",
+            "graeae_weight": 0.75,
+        },
     ]
     assert _apply_priority_ceiling(candidates, 14) == [candidates[1]]
 
@@ -976,10 +1108,24 @@ def test_g1_priority_quality_floor_boundary(monkeypatch):
 def test_burned_g1_session_keeps_requested_quality_floor(monkeypatch):
     monkeypatch.setattr(get_settings().knemon, "g1_quality_floor", 0.85)
     candidates = [
-        {"provider": "cheap", "model_id": "below", "quality": 0.80, "tier": "B", "graeae_weight": 0.99},
-        {"provider": "good", "model_id": "frontier", "quality": 0.90, "tier": "A", "graeae_weight": 0.75},
+        {
+            "provider": "cheap",
+            "model_id": "below",
+            "quality": 0.80,
+            "tier": "B",
+            "graeae_weight": 0.99,
+        },
+        {
+            "provider": "good",
+            "model_id": "frontier",
+            "quality": 0.90,
+            "tier": "A",
+            "graeae_weight": 0.75,
+        },
     ]
-    assert _apply_priority_ceiling(candidates, 13, requested_priority=14) == [candidates[1]]
+    assert _apply_priority_ceiling(candidates, 13, requested_priority=14) == [
+        candidates[1]
+    ]
 
 
 @pytest.mark.parametrize(
@@ -990,7 +1136,9 @@ def test_burned_g1_session_keeps_requested_quality_floor(monkeypatch):
     ],
 )
 @pytest.mark.asyncio
-async def test_date_aware_plan_selection_honors_tier_flip_date(as_of: date, expected_plan: str):
+async def test_date_aware_plan_selection_honors_tier_flip_date(
+    as_of: date, expected_plan: str
+):
     backend = _SqliteKnemonBackend(0)
     backend.conn.executescript(
         """
@@ -1037,13 +1185,19 @@ async def test_session_burn_threshold_honors_env_override(monkeypatch):
     monkeypatch.setenv("MNEMOS_KNEMON_SESSION_BURN_REQUESTS_PER_HOUR", "12")
     config_mod._reset_settings_for_tests()
     try:
-        below = _SqliteKnemonBackend(70, burned_session="custom-threshold-below", burned_request_count=10)
+        below = _SqliteKnemonBackend(
+            70, burned_session="custom-threshold-below", burned_request_count=10
+        )
         below_decision = await route(_req(14, "custom-threshold-below"), below)
         assert below_decision.provider == "openai"
         assert below_decision.auth_method == "subscription"
 
-        at_threshold = _SqliteKnemonBackend(70, burned_session="custom-threshold-at", burned_request_count=12)
-        at_threshold_decision = await route(_req(14, "custom-threshold-at"), at_threshold)
+        at_threshold = _SqliteKnemonBackend(
+            70, burned_session="custom-threshold-at", burned_request_count=12
+        )
+        at_threshold_decision = await route(
+            _req(14, "custom-threshold-at"), at_threshold
+        )
         assert at_threshold_decision.provider == "xai"
         assert at_threshold_decision.auth_method == "api"
     finally:
@@ -1052,7 +1206,9 @@ async def test_session_burn_threshold_honors_env_override(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_session_below_burn_threshold_keeps_g1_subscription_escalation():
-    backend = _SqliteKnemonBackend(70, burned_session="not-yet-burned", burned_request_count=9)
+    backend = _SqliteKnemonBackend(
+        70, burned_session="not-yet-burned", burned_request_count=9
+    )
     decision = await route(_req(14, "not-yet-burned"), backend)
     assert decision.provider == "openai"
     assert decision.auth_method == "subscription"
@@ -1067,34 +1223,79 @@ def _diverse_task_backend() -> _SqliteKnemonBackend:
     # Clear the default 4-model seed so capability assertions are exact.
     backend.conn.execute("DELETE FROM model_registry")
     backend.conn.execute("DELETE FROM subscription_plans")
-    now = datetime.now(timezone.utc)
     models = [
         # coding
-        ("nvidia", "qwen/qwen3-coder-480b-a35b-instruct", "Qwen3 Coder 480B",
-         '["chat","code","reasoning"]', 1.0, 3.0, 0.86),
-        ("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6",
-         '["chat","code","reasoning"]', 3.0, 15.0, 0.94),
+        (
+            "nvidia",
+            "qwen/qwen3-coder-480b-a35b-instruct",
+            "Qwen3 Coder 480B",
+            '["chat","code","reasoning"]',
+            1.0,
+            3.0,
+            0.86,
+        ),
+        (
+            "anthropic",
+            "claude-sonnet-4-6",
+            "Claude Sonnet 4.6",
+            '["chat","code","reasoning"]',
+            3.0,
+            15.0,
+            0.94,
+        ),
         # narrative (chat)
-        ("anthropic", "claude-opus-4-6", "Claude Opus 4.6",
-         '["chat","code","reasoning"]', 15.0, 75.0, 0.99),
-        ("gemini", "gemini-2.5-flash", "Gemini 2.5 Flash",
-         '["chat"]', 0.15, 0.60, 0.82),
+        (
+            "anthropic",
+            "claude-opus-4-6",
+            "Claude Opus 4.6",
+            '["chat","code","reasoning"]',
+            15.0,
+            75.0,
+            0.99,
+        ),
+        (
+            "gemini",
+            "gemini-2.5-flash",
+            "Gemini 2.5 Flash",
+            '["chat"]',
+            0.15,
+            0.60,
+            0.82,
+        ),
         # reasoning
-        ("deepseek-direct", "deepseek-v4-pro", "DeepSeek V4 Pro",
-         '["chat","code","reasoning"]', 0.435, 0.87, 0.85),
+        (
+            "deepseek-direct",
+            "deepseek-v4-pro",
+            "DeepSeek V4 Pro",
+            '["chat","code","reasoning"]',
+            0.435,
+            0.87,
+            0.85,
+        ),
         # embedding
-        ("mnemos-local", "bge-m3", "BGE M3",
-         '["embeddings"]', 0.0, 0.0, 0.82),
-        ("voyage", "voyage-3", "Voyage 3",
-         '["embeddings"]', 0.0, 0.0, 0.80),
+        ("mnemos-local", "bge-m3", "BGE M3", '["embeddings"]', 0.0, 0.0, 0.82),
+        ("voyage", "voyage-3", "Voyage 3", '["embeddings"]', 0.0, 0.0, 0.80),
         # routing (small/fast)
-        ("groq", "llama-3.1-8b-instant", "Llama 3.1 8B Instant",
-         '["chat","routing"]', 0.05, 0.08, 0.78),
-        ("nvidia", "moonshotai/kimi-k2.6", "Kimi K2.6",
-         '["chat","routing"]', 0.10, 0.15, 0.79),
+        (
+            "groq",
+            "llama-3.1-8b-instant",
+            "Llama 3.1 8B Instant",
+            '["chat","routing"]',
+            0.05,
+            0.08,
+            0.78,
+        ),
+        (
+            "nvidia",
+            "moonshotai/kimi-k2.6",
+            "Kimi K2.6",
+            '["chat","routing"]',
+            0.10,
+            0.15,
+            0.79,
+        ),
         # generic fallback (api-only, cheap)
-        ("xai", "grok-api", "Grok API",
-         '["chat","code"]', 3.0, 15.0, 0.86),
+        ("xai", "grok-api", "Grok API", '["chat","code"]', 3.0, 15.0, 0.86),
     ]
     for provider, model_id, display_name, caps, in_cost, out_cost, weight in models:
         backend.conn.execute(
@@ -1102,8 +1303,16 @@ def _diverse_task_backend() -> _SqliteKnemonBackend:
             (provider, model_id, display_name, caps, in_cost, out_cost, weight),
         )
     # Give every provider an api plan so waterfall doesn't skip them.
-    for provider in {"nvidia", "anthropic", "gemini", "deepseek-direct", "mnemos-local",
-                      "voyage", "groq", "xai"}:
+    for provider in {
+        "nvidia",
+        "anthropic",
+        "gemini",
+        "deepseek-direct",
+        "mnemos-local",
+        "voyage",
+        "groq",
+        "xai",
+    }:
         backend.conn.execute(
             "INSERT INTO subscription_plans VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL,"
             " 'monthly', NULL, NULL, '2026-01-01', NULL, NULL)",
@@ -1131,13 +1340,15 @@ def _task_req(task_kind: str, priority: int = 14) -> KnemonRouteRequest:
     ("task_kind", "expected_provider", "expected_model_prefix"),
     [
         ("code-fix", "nvidia", "qwen/qwen3-coder"),
-        ("narrative", "anthropic", "claude-sonnet"),          # sonnet not opus
-        ("reasoning", "anthropic", "claude-opus"),            # opus for reasoning
+        ("narrative", "anthropic", "claude-sonnet"),  # sonnet not opus
+        ("reasoning", "anthropic", "claude-opus"),  # opus for reasoning
         ("embedding", "mnemos-local", "bge-m3"),
         ("routing", "groq", "llama-3.1-8b-instant"),
     ],
 )
-async def test_task_type_routes_to_different_models(task_kind, expected_provider, expected_model_prefix):
+async def test_task_type_routes_to_different_models(
+    task_kind, expected_provider, expected_model_prefix
+):
     """Each task_type MUST return a different model — not all the same Opus."""
     backend = _diverse_task_backend()
     decision = await route(_task_req(task_kind), backend)

@@ -8,17 +8,19 @@ from decimal import Decimal
 from importlib.resources import files
 from types import SimpleNamespace
 
+import mnemos.api.routes.ledger as ledger_mod
+import mnemos.core.lifecycle as lifecycle
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-
-import mnemos.core.lifecycle as lifecycle
-import mnemos.api.routes.ledger as ledger_mod
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.routes.ledger import router as ledger_router
 from mnemos.core.config import get_settings
-from mnemos.domain.knemon.router import _reserve_session_burn, reconcile_burn_reservation
 from mnemos.core.plan_windows import _PLAN_WINDOWS
+from mnemos.domain.knemon.router import (
+    _reserve_session_burn,
+    reconcile_burn_reservation,
+)
 from mnemos.persistence.base import UsageLedgerRecord, UsageLedgerResult
 from mnemos.persistence.postgres import PostgresBackend, PostgresTransaction
 
@@ -102,7 +104,9 @@ class _Db2LedgerCursor:
         self.sql_calls.append(sql)
         self.params_calls.append(params)
         if "subscription_plans" in sql or "model_registry" in sql:
-            raise _Db2MissingTableError("SQL0204N model_registry is an undefined name. SQLSTATE=42704")
+            raise _Db2MissingTableError(
+                "SQL0204N model_registry is an undefined name. SQLSTATE=42704"
+            )
 
     async def fetchone(self):
         return self.row
@@ -174,7 +178,12 @@ async def test_postgres_record_usage_ledger_inserts_with_registry_prices():
 @pytest.mark.asyncio
 async def test_postgres_record_usage_ledger_records_and_warns_for_unknown_model(caplog):
     conn = _RecorderConn()
-    conn.row = {"id": 43, "est_cost_usd": Decimal("0"), "registry_match": False, "auth_method": "api"}
+    conn.row = {
+        "id": 43,
+        "est_cost_usd": Decimal("0"),
+        "registry_match": False,
+        "auth_method": "api",
+    }
     tx = PostgresTransaction(conn, _RawTx())  # type: ignore[arg-type]
     backend = PostgresBackend(pool=SimpleNamespace(), settings=_settings())  # type: ignore[arg-type]
 
@@ -200,8 +209,12 @@ async def test_postgres_record_usage_ledger_records_and_warns_for_unknown_model(
 
 
 @pytest.mark.asyncio
-async def test_oracle_record_usage_ledger_records_when_model_registry_missing(monkeypatch, caplog):
-    monkeypatch.setitem(sys.modules, "oracledb", SimpleNamespace(DB_TYPE_NUMBER=object()))
+async def test_oracle_record_usage_ledger_records_when_model_registry_missing(
+    monkeypatch, caplog
+):
+    monkeypatch.setitem(
+        sys.modules, "oracledb", SimpleNamespace(DB_TYPE_NUMBER=object())
+    )
 
     from mnemos.persistence.oracle import OracleBackend
 
@@ -306,6 +319,7 @@ class _EndpointBackend:
               id INTEGER PRIMARY KEY,
               ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
               session_id TEXT,
+              caller_subsystem TEXT,
               request_count INTEGER NOT NULL DEFAULT 1
             );
             """
@@ -321,7 +335,9 @@ class _EndpointBackend:
         else:
             self.conn.commit()
 
-    async def record_usage_ledger(self, tx, record: UsageLedgerRecord) -> UsageLedgerResult:
+    async def record_usage_ledger(
+        self, tx, record: UsageLedgerRecord
+    ) -> UsageLedgerResult:
         self.records.append(record)
         tx.execute(
             "INSERT INTO usage_ledger (id, ts, session_id, request_count) VALUES (7, ?, ?, ?)",
@@ -463,7 +479,9 @@ async def test_ledger_endpoint_infers_known_subscription_path_kind(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_audit_session_usage_is_enforced_against_authenticated_principal(monkeypatch):
+async def test_audit_session_usage_is_enforced_against_authenticated_principal(
+    monkeypatch,
+):
     backend = _EndpointBackend()
     monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
     monkeypatch.setattr(get_settings().knemon, "session_burn_requests_per_hour", 10)
@@ -677,9 +695,10 @@ async def test_ledger_endpoint_migrates_missing_reservation_schema(monkeypatch):
         )
 
     assert response.status_code == 200
-    assert backend.conn.execute(
-        "SELECT COUNT(*) FROM knemon_burn_sessions"
-    ).fetchone()[0] == 1
+    assert (
+        backend.conn.execute("SELECT COUNT(*) FROM knemon_burn_sessions").fetchone()[0]
+        == 1
+    )
 
 
 def test_burn_reservation_migrations_cover_all_supported_backends():
@@ -709,11 +728,19 @@ def test_usage_ledger_migrations_preserve_constraint_parity():
     for sql in (pg, oracle, db2):
         normalized = " ".join(sql.lower().split())
         assert "tokens_reasoning" in normalized and "not null" in normalized
-        assert "est_cost_usd" in normalized and "check (est_cost_usd >= 0)" in normalized
+        assert (
+            "est_cost_usd" in normalized and "check (est_cost_usd >= 0)" in normalized
+        )
         assert "check (outcome in ('ok','err','timeout'))" in normalized
         assert "check (latency_ms >= 0)" in normalized
 
 
 def test_plan_window_hints_preserve_expired_claude_rows_for_historical_ledgers():
-    assert _PLAN_WINDOWS[("anthropic", "claude_max_interactive_post_jun15")] == ("rolling", 18000)
-    assert _PLAN_WINDOWS[("anthropic", "agent_sdk_credit_pool_post_jun15")] == ("monthly", None)
+    assert _PLAN_WINDOWS[("anthropic", "claude_max_interactive_post_jun15")] == (
+        "rolling",
+        18000,
+    )
+    assert _PLAN_WINDOWS[("anthropic", "agent_sdk_credit_pool_post_jun15")] == (
+        "monthly",
+        None,
+    )

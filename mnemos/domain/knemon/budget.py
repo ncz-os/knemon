@@ -1,41 +1,13 @@
-"""KNEMON-owned usage budget decisions backed by ``usage_ledger``.
+"""KNEMON monetary admission and crash-safe per-attempt accounting.
 
-F04: provider budgets do not reserve money atomically
----------------------------------------------------
+Admission serializes each caller subsystem in the database and counts ledger
+spend, unlinked settled costs, and all outstanding reservations. Finalization
+links a ledger append in the same transaction. Expiry is recovery provenance,
+not proof an upstream request was free; late authoritative usage corrects it.
 
-A COMPANION fix (F05) lands in PANTHEON at the same time, but KNEMON
-is the authority for cost-reservation. This module adds:
-
-* ``canonical_budget_key(provider, model)`` — the single canonical
-  identity helper that PANTHEON's companion fix should call instead of
-  reimplementing the alias table inline. KNEMON's existing provider
-  alias table (``claude`` → ``anthropic``) lives here; PANTHEON is
-  expected to consume this so a budget cap set under one name applies
-  under any alias.
-* ``reserve_cost(backend, *, provider, model, estimated_cost_usd,
-  attempt_id, caller_subsystem, ttl_seconds)`` — durably records a
-  pending reservation keyed by the caller's per-attempt id, atomically
-  checking that committed spend PLUS outstanding pending reservations
-  stay under the budget cap. The reservation row survives process /
-  host restart, so the fleet-wide admission decision is no longer a
-  read-then-decide race.
-* ``settle_cost(backend, *, attempt_id, actual_cost_usd)`` —
-  transitions a pending reservation to ``settled`` with the REAL
-  post-call cost. Idempotent: settling the same ``attempt_id`` twice
-  does not double-count.
-* ``release_cost(backend, *, attempt_id)`` — returns the headroom for
-  a pending reservation when the call is aborted before completion.
-  Idempotent and safe to a no-op when called on an already-settled or
-  already-released attempt_id.
-* ``effective_spend_usd(backend, *, ...)`` — like ``weekly_spend_usd``
-  but also includes pending reservations in the headroom math, so
-  admission checks serialize across processes without a separate
-  reservation step.
-
-The ``evaluate_usage_budget`` decision path still raises loudly
-rather than swallowing write failures (the prior behavior suppressed
-ledger-write errors, which masked stale read-then-decide accounting
-across multiple hosts).
+The aggregate table is a serialized reporting snapshot. Admission uses indexed
+rolling SUM queries: it does not rely on a stale cache or claim constant-time
+work as the seven-day ledger grows.
 """
 
 from __future__ import annotations
@@ -102,7 +74,7 @@ class ReservationHandle:
     the token PANTHEON's companion F05 fix should return from its
     admission call site and pass back into ``settle_cost`` /
     ``release_cost``. ``expires_at`` is the durable TTL after which a
-    crashed caller's reservation is auto-released by the cleanup path.
+    crashed caller's reservation is conservatively settled by recovery.
     """
 
     attempt_id: str
@@ -124,7 +96,13 @@ class ReservationHandle:
 # KNEMON <-> PANTHEON boundary; PANTHEON's F05 fix MUST consume this helper
 # instead of reimplementing the alias table inline. See ``canonical_budget_key``
 # below.
-_PROVIDER_ALIASES: dict[str, str] = {"claude": "anthropic"}
+_PROVIDER_ALIASES: dict[str, str] = {
+    "claude": "anthropic",
+    "google": "gemini",
+    "ngc": "nvidia",
+    "eih": "nvidia",
+    "ngc-eih": "nvidia",
+}
 
 # Sentinel row key for the read-path spend aggregate. SQLite does NOT
 # enforce UNIQUE on NULL values, so a NULLable provider column on the
@@ -146,6 +124,28 @@ def _canon_provider(name: str | None) -> str:
     return _PROVIDER_ALIASES.get(canon, canon)
 
 
+def _canonical_caps(caps: dict[str, float]) -> dict[str, float]:
+    result = {}
+    for name, cap in caps.items():
+        value, valid = _normalise_estimated_cost(cap)
+        if valid and value > 0 and name.strip():
+            key = _canon_provider(name)
+            result[key] = min(result.get(key, value), value)
+    return result
+
+
+def _as_datetime(value: Any) -> datetime:
+    parsed = (
+        value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    )
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def _time_sql(conn: Any, value: str) -> str:
+    # SQLite timestamps can contain T or space; lexical comparison is incorrect.
+    return f"julianday({value})" if _connection_dialect(conn) == "sqlite" else value
+
+
 def _aggregate_provider_key(provider: str | None) -> str:
     """Normalise a Python ``provider`` value for the aggregate's primary key.
 
@@ -163,9 +163,7 @@ def _aggregate_provider_key(provider: str | None) -> str:
     return _canon_provider(provider)
 
 
-def canonical_budget_key(
-    provider: str | None, model: str | None
-) -> tuple[str, str]:
+def canonical_budget_key(provider: str | None, model: str | None) -> tuple[str, str]:
     """Return the canonical (provider, model) identity for budget keys.
 
     F05 (PANTHEON) MUST call this helper before persisting budget
@@ -228,7 +226,9 @@ def _cost_reservation_retention_seconds() -> int:
 # ---------------------------------------------------------------------------
 
 
-async def _ensure_and_lock_reservation_lock(conn: Any, caller_subsystem: str, now: datetime) -> None:
+async def _ensure_and_lock_reservation_lock(
+    conn: Any, caller_subsystem: str, now: datetime
+) -> None:
     """Acquire a per-caller_subsystem row lock for atomic reservation math.
 
     Mirrors the pattern in ``_ensure_and_lock_burn_session`` —
@@ -286,7 +286,8 @@ async def _ensure_and_lock_reservation_lock(conn: Any, caller_subsystem: str, no
     lock_suffix = "" if dialect == "sqlite" else " FOR UPDATE"
     await _tx_rows(
         conn,
-        "SELECT caller_subsystem FROM knemon_cost_reservation_locks WHERE caller_subsystem = :caller_subsystem" + lock_suffix,
+        "SELECT caller_subsystem FROM knemon_cost_reservation_locks WHERE caller_subsystem = :caller_subsystem"
+        + lock_suffix,
         {"caller_subsystem": caller_subsystem},
     )
     await _tx_execute(
@@ -414,13 +415,16 @@ async def effective_spend_usd(
     so a fleet of processes cannot all admit against the same remaining
     headroom before any of them has actually recorded the spend.
     """
-    committed = await weekly_spend_usd(
-        backend, caller_subsystem=caller_subsystem, provider=provider, now=now
-    )
-    pending = await pending_reservations_usd(
-        backend, caller_subsystem=caller_subsystem, provider=provider, now=now
-    )
-    return float(committed) + float(pending)
+    from mnemos.domain.knemon.migrations import ensure_knemon_schema
+
+    await ensure_knemon_schema(backend)
+    async with backend.transactional() as tx:
+        return await effective_spend_usd_tx(
+            _conn_from_tx(tx),
+            caller_subsystem=caller_subsystem,
+            provider=provider,
+            now=now,
+        )
 
 
 def _evaluate_single_cap(
@@ -444,7 +448,11 @@ def _evaluate_single_cap(
             else f"{label} budget exhausted ({spent_usd:.4f}/{limit_usd:.4f})"
         )
         return BudgetDecision(
-            BudgetVerdict.DENY, remaining, reason, spent_usd=spent_usd, limit_usd=limit_usd
+            BudgetVerdict.DENY,
+            remaining,
+            reason,
+            spent_usd=spent_usd,
+            limit_usd=limit_usd,
         )
     if estimated_cost_usd > 0 and (spent_usd + estimated_cost_usd) > limit_usd:
         reason = (
@@ -453,7 +461,11 @@ def _evaluate_single_cap(
             else f"estimated ${estimated_cost_usd:.4f} would exceed {label} remaining ${remaining:.4f}"
         )
         return BudgetDecision(
-            BudgetVerdict.DENY, remaining, reason, spent_usd=spent_usd, limit_usd=limit_usd
+            BudgetVerdict.DENY,
+            remaining,
+            reason,
+            spent_usd=spent_usd,
+            limit_usd=limit_usd,
         )
     within = "within budget" if label == "budget" else f"within {label} budget"
     return BudgetDecision(
@@ -514,11 +526,7 @@ async def evaluate_usage_budget(
 
     if provider_caps is None:
         provider_caps = get_settings().knemon.parsed_provider_budget_caps_usd()
-    configured_provider_caps = {
-        str(name).strip().lower(): float(cap)
-        for name, cap in provider_caps.items()
-        if str(name).strip() and cap is not None and float(cap) > 0
-    }
+    configured_provider_caps = _canonical_caps(provider_caps)
     if configured_provider_caps and not provider_key:
         return BudgetDecision(
             BudgetVerdict.DENY,
@@ -533,7 +541,9 @@ async def evaluate_usage_budget(
             provider_cap = float(candidate)
 
     if limit_usd is None and provider_cap is None:
-        return BudgetDecision(BudgetVerdict.ALLOW, float("inf"), "no limit", limit_usd=None)
+        return BudgetDecision(
+            BudgetVerdict.ALLOW, float("inf"), "no limit", limit_usd=None
+        )
 
     if not estimate_valid:
         return BudgetDecision(
@@ -563,7 +573,8 @@ async def evaluate_usage_budget(
             )
         except Exception as exc:
             logger.warning(
-                "KNEMON budget ledger query failed; denying under configured cap: %s", exc
+                "KNEMON budget ledger query failed; denying under configured cap: %s",
+                exc,
             )
             return BudgetDecision(
                 BudgetVerdict.DENY,
@@ -585,11 +596,16 @@ async def evaluate_usage_budget(
         label = f"provider:{provider_key}"
         try:
             spent_provider = await effective_spend_usd(
-                backend, provider=provider_key, caller_subsystem=caller_subsystem, now=now
+                backend,
+                provider=provider_key,
+                caller_subsystem=caller_subsystem,
+                now=now,
             )
         except Exception as exc:
             logger.warning(
-                "KNEMON %s ledger query failed; denying under configured cap: %s", label, exc
+                "KNEMON %s ledger query failed; denying under configured cap: %s",
+                label,
+                exc,
             )
             return BudgetDecision(
                 BudgetVerdict.DENY,
@@ -658,7 +674,9 @@ async def reserve_cost(
         )
 
     current = now or datetime.now(timezone.utc)
-    ttl = int(ttl_seconds) if ttl_seconds is not None else _cost_reservation_ttl_seconds()
+    ttl = (
+        int(ttl_seconds) if ttl_seconds is not None else _cost_reservation_ttl_seconds()
+    )
     expires_at = current + timedelta(seconds=max(1, ttl))
 
     # Best-effort migration trigger; raises loudly if it can't apply.
@@ -677,11 +695,7 @@ async def reserve_cost(
         limit_usd = configured if configured > 0 else None
     if provider_caps is None:
         provider_caps = get_settings().knemon.parsed_provider_budget_caps_usd()
-    configured_provider_caps = {
-        str(name).strip().lower(): float(cap)
-        for name, cap in provider_caps.items()
-        if str(name).strip() and cap is not None and float(cap) > 0
-    }
+    configured_provider_caps = _canonical_caps(provider_caps)
     provider_cap = configured_provider_caps.get(canon_provider)
 
     async with backend.transactional() as tx:
@@ -713,20 +727,30 @@ async def reserve_cost(
                     f"attempt_id={attempt_id} already finalized as {status!r}; "
                     f"reserve_cost is not idempotent across terminal states"
                 )
-            reserved_at = row.get("reserved_at")
-            existing_expires = row.get("expires_at")
-            if hasattr(reserved_at, "isoformat"):
-                reserved_at = reserved_at
-            if hasattr(existing_expires, "isoformat"):
-                existing_expires = existing_expires
+            reserved_at = _as_datetime(row["reserved_at"])
+            existing_expires = _as_datetime(row["expires_at"])
+            if (
+                str(row["provider"]),
+                str(row["model"]),
+                str(row["caller_subsystem"]),
+                float(row["estimated_cost_usd"]),
+            ) != (
+                canon_provider,
+                canon_model,
+                caller_subsystem,
+                estimated_cost_usd,
+            ) or existing_expires <= current:
+                raise CostReservationConflict(
+                    f"attempt_id={attempt_id} payload changed or expired"
+                )
             return ReservationHandle(
-                attempt_id=str(row.get("attempt_id")),
-                provider=str(row.get("provider") or canon_provider),
-                model=str(row.get("model") or canon_model),
-                caller_subsystem=str(row.get("caller_subsystem") or caller_subsystem),
-                estimated_cost_usd=float(row.get("estimated_cost_usd") or 0.0),
-                reserved_at=reserved_at if isinstance(reserved_at, datetime) else current,
-                expires_at=existing_expires if isinstance(existing_expires, datetime) else expires_at,
+                attempt_id,
+                canon_provider,
+                canon_model,
+                caller_subsystem,
+                estimated_cost_usd,
+                reserved_at,
+                existing_expires,
             )
 
         # Sum committed + pending (effective spend) so concurrent reserves
@@ -735,7 +759,10 @@ async def reserve_cost(
             effective_global = await effective_spend_usd_tx(
                 conn, caller_subsystem=caller_subsystem, now=current
             )
-            if limit_usd is not None and (effective_global + estimated_cost_usd) > limit_usd:
+            if (
+                limit_usd is not None
+                and (effective_global + estimated_cost_usd) > limit_usd
+            ):
                 raise CostReservationConflict(
                     f"attempt_id={attempt_id} would exceed global cap "
                     f"{limit_usd:.4f} (committed+pending+estimate={effective_global + estimated_cost_usd:.4f})"
@@ -792,27 +819,22 @@ async def reserve_cost(
         # pre-reservation counter or the post-reservation counter,
         # never a partial state. Both granularities (provider-scoped
         # and unfiltered) are bumped.
-        try:
-            await _upsert_spend_aggregate_row(
-                conn,
-                caller_subsystem=caller_subsystem,
-                provider=canon_provider,
-                pending_delta=estimated_cost_usd,
-                window_start_ts=_spend_aggregate_window_start(current),
-                now=current,
-            )
-            await _upsert_spend_aggregate_row(
-                conn,
-                caller_subsystem=caller_subsystem,
-                provider=_AGGREGATE_ALL_PROVIDERS_SENTINEL,
-                pending_delta=estimated_cost_usd,
-                window_start_ts=_spend_aggregate_window_start(current),
-                now=current,
-            )
-        except Exception as exc:  # pragma: no cover — defensive
-            logger.warning(
-                "reserve_cost failed to update spend aggregate: %s", exc
-            )
+        await _upsert_spend_aggregate_row(
+            conn,
+            caller_subsystem=caller_subsystem,
+            provider=canon_provider,
+            pending_delta=estimated_cost_usd,
+            window_start_ts=_spend_aggregate_window_start(current),
+            now=current,
+        )
+        await _upsert_spend_aggregate_row(
+            conn,
+            caller_subsystem=caller_subsystem,
+            provider=_AGGREGATE_ALL_PROVIDERS_SENTINEL,
+            pending_delta=estimated_cost_usd,
+            window_start_ts=_spend_aggregate_window_start(current),
+            now=current,
+        )
 
     return ReservationHandle(
         attempt_id=attempt_id,
@@ -825,6 +847,58 @@ async def reserve_cost(
     )
 
 
+async def _spend_components_tx(
+    conn: Any,
+    *,
+    caller_subsystem: str,
+    provider: str | None,
+    now: datetime,
+    since: datetime,
+) -> tuple[float, float]:
+    params = {"caller_subsystem": caller_subsystem, "since_ts": since, "now_ts": now}
+    clause = ""
+    if provider and provider != "*":
+        canonical = _canon_provider(provider)
+        names = sorted(
+            {canonical, *(k for k, v in _PROVIDER_ALIASES.items() if v == canonical)}
+        )
+        binds = []
+        for i, name in enumerate(names):
+            params[f"provider_{i}"] = name
+            binds.append(f":provider_{i}")
+        clause = "AND LOWER(provider) IN (" + ", ".join(binds) + ")"
+    ledger = await _tx_rows(
+        conn,
+        f"""
+        SELECT COALESCE(SUM(est_cost_usd), 0) AS amount FROM usage_ledger
+        WHERE caller_subsystem = :caller_subsystem AND {_time_sql(conn, "ts")} >= {_time_sql(conn, ":since_ts")} {clause}
+        """,
+        params,
+    )
+    settled = await _tx_rows(
+        conn,
+        f"""
+        SELECT COALESCE(SUM(actual_cost_usd), 0) AS amount FROM knemon_cost_reservations r
+        WHERE status = 'settled' AND caller_subsystem = :caller_subsystem
+          AND {_time_sql(conn, "settled_at")} >= {_time_sql(conn, ":since_ts")}
+          AND (ledger_id IS NULL OR NOT EXISTS (SELECT 1 FROM usage_ledger l WHERE l.id = r.ledger_id)) {clause}
+        """,
+        params,
+    )
+    pending = await _tx_rows(
+        conn,
+        f"""
+        SELECT COALESCE(SUM(estimated_cost_usd), 0) AS amount FROM knemon_cost_reservations
+        WHERE status = 'pending' AND caller_subsystem = :caller_subsystem {clause}
+        """,
+        params,
+    )
+    # Expiry is not proof an upstream request was free. Recovery settles conservatively.
+    return float(ledger[0]["amount"]) + float(settled[0]["amount"]), float(
+        pending[0]["amount"]
+    )
+
+
 async def effective_spend_usd_tx(
     conn: Any,
     *,
@@ -832,58 +906,39 @@ async def effective_spend_usd_tx(
     provider: str | None = None,
     now: datetime | None = None,
 ) -> float:
-    """Effective spend computed on an already-open transaction connection.
-
-    Same semantics as ``effective_spend_usd`` but joins an existing
-    transaction (avoiding opening a new one). Used by
-    ``reserve_cost`` so the per-caller_subsystem lock and the
-    effective-spend SUM happen in the same atomic transaction.
-    """
     current = now or datetime.now(timezone.utc)
-    since = current - timedelta(days=7)
-    committed_params: dict[str, Any] = {
-        "caller_subsystem": caller_subsystem,
-        "since_ts": since,
-    }
-    provider_clause = ""
-    if provider:
-        committed_params["provider"] = provider.strip().lower()
-        provider_clause = "AND LOWER(provider) = :provider"
-    committed_rows = await _tx_rows(
+    committed, pending = await _spend_components_tx(
         conn,
-        f"""
-        SELECT COALESCE(SUM(est_cost_usd), 0) AS spent_usd
-        FROM usage_ledger
-        WHERE caller_subsystem = :caller_subsystem
-          AND ts >= :since_ts
-          {provider_clause}
-        """,
-        committed_params,
+        caller_subsystem=caller_subsystem,
+        provider=provider,
+        now=current,
+        since=current - timedelta(days=7),
     )
-    committed = _to_float((committed_rows[0] if committed_rows else {}).get("spent_usd"), 0.0)
+    return committed + pending
 
-    pending_params: dict[str, Any] = {
-        "caller_subsystem": caller_subsystem,
-        "now_ts": current,
-    }
-    pending_provider_clause = ""
-    if provider:
-        pending_params["provider"] = provider.strip().lower()
-        pending_provider_clause = "AND LOWER(provider) = :provider"
-    pending_rows = await _tx_rows(
+
+async def _locked_attempt(conn: Any, attempt_id: str, current: datetime) -> dict | None:
+    rows = await _tx_rows(
         conn,
-        f"""
-        SELECT COALESCE(SUM(estimated_cost_usd), 0) AS pending_usd
-        FROM knemon_cost_reservations
-        WHERE status = 'pending'
-          AND caller_subsystem = :caller_subsystem
-          AND expires_at > :now_ts
-          {pending_provider_clause}
-        """,
-        pending_params,
+        "SELECT caller_subsystem FROM knemon_cost_reservations WHERE attempt_id = :id",
+        {"id": attempt_id},
     )
-    pending = _to_float((pending_rows[0] if pending_rows else {}).get("pending_usd"), 0.0)
-    return float(committed) + float(pending)
+    if not rows:
+        return None
+    await _ensure_and_lock_reservation_lock(conn, rows[0]["caller_subsystem"], current)
+    rows = await _tx_rows(
+        conn,
+        "SELECT * FROM knemon_cost_reservations WHERE attempt_id = :id",
+        {"id": attempt_id},
+    )
+    return rows[0] if rows else None
+
+
+async def _refresh_attempt_scopes(conn: Any, row: dict, now: datetime) -> None:
+    for provider in (row["provider"], None):
+        await _reconcile_spend_aggregates_tx(
+            conn, caller_subsystem=row["caller_subsystem"], provider=provider, now=now
+        )
 
 
 async def settle_cost(
@@ -894,251 +949,166 @@ async def settle_cost(
     ledger_id: int | None = None,
     now: datetime | None = None,
 ) -> None:
-    """Finalize a pending reservation to its ACTUAL post-call cost.
-
-    F04 contract:
-
-    * Idempotent: settling the same ``attempt_id`` twice does NOT
-      double-count. The second call is a no-op (returns ``None``).
-    * Raises ``CostReservationConflict`` only if the attempt_id is in
-      a non-pending state but with a DIFFERENT ``actual_cost_usd``
-      recorded (a real double-settle). Already-released attempts are
-      treated as "the caller's view changed", not as a conflict, so
-      callers that release-then-settle in a race don't fail loudly.
-    """
-    actual_cost_usd, valid = _normalise_estimated_cost(actual_cost_usd)
-    if not valid:
-        raise CostReservationConflict(
-            f"invalid actual_cost_usd {actual_cost_usd!r} for attempt_id={attempt_id}"
-        )
-
-    current = now or datetime.now(timezone.utc)
-    params: dict[str, Any] = {
-        "attempt_id": attempt_id,
-        "now_ts": current,
-        "actual_cost_usd": actual_cost_usd,
-    }
-    if ledger_id is not None:
-        params["ledger_id"] = ledger_id
-
+    """Persist billable outcomes, serializing admission and deduplicating ledger linkage."""
     async with backend.transactional() as tx:
-        conn = _conn_from_tx(tx)
-        rows = await _tx_rows(
-            conn,
-            """
-            SELECT attempt_id, status, actual_cost_usd, provider,
-                   caller_subsystem, estimated_cost_usd
-            FROM knemon_cost_reservations
-            WHERE attempt_id = :attempt_id
-            """,
-            {"attempt_id": attempt_id},
+        await settle_cost_in_transaction(
+            tx,
+            attempt_id=attempt_id,
+            actual_cost_usd=actual_cost_usd,
+            ledger_id=ledger_id,
+            now=now,
         )
-        if not rows:
-            # No reservation — silently no-op (idempotent for callers that
-            # never reserved, e.g. older PANTHEON versions).
-            return
-        row = rows[0]
-        status = str(row.get("status") or "")
-        existing_actual = row.get("actual_cost_usd")
-        if status == "settled":
-            # Idempotent: same actual cost is a no-op. Different actual cost
-            # is a real double-settle and we raise.
-            if existing_actual is not None and _to_float(existing_actual, -1.0) != actual_cost_usd:
-                raise CostReservationConflict(
-                    f"attempt_id={attempt_id} already settled with actual_cost_usd={existing_actual!r}, "
-                    f"refusing to overwrite with {actual_cost_usd!r}"
-                )
-            return
-        if status == "released":
-            # The caller's view changed mid-flight. Don't pretend to
-            # re-settle a released reservation; log + silently no-op so
-            # cleanup paths don't fail loudly.
-            logger.info(
-                "KNEMON settle_cost called on released attempt_id=%s; ignoring", attempt_id
-            )
-            return
-        # status == "pending" — promote to settled.
-        update_sql = """
-            UPDATE knemon_cost_reservations
-            SET status = 'settled',
-                settled_at = :now_ts,
-                actual_cost_usd = :actual_cost_usd
-            WHERE attempt_id = :attempt_id AND status = 'pending'
-        """
-        params_for_update = {
-            "attempt_id": attempt_id,
-            "now_ts": current,
-            "actual_cost_usd": actual_cost_usd,
-        }
-        if ledger_id is not None:
-            update_sql += ", ledger_id = :ledger_id"
-            params_for_update["ledger_id"] = ledger_id
-        await _tx_execute(conn, update_sql, params_for_update)
 
-        # Maintain the read-path spend aggregate in the SAME
-        # transaction as the reservation write. A pending reservation
-        # was holding pending_usd headroom in the aggregate; the
-        # settle replaces it with committed_usd. If both rows were
-        # already present we leave them as-is; in the normal flow the
-        # reserve_cost that created this row would have inserted the
-        # pending entry, so the absolute value is unchanged (the
-        # reservation row is what the fresh SUM counts).
-        try:
-            await _upsert_spend_aggregate_row(
-                conn,
-                caller_subsystem=str(row.get("caller_subsystem") or "pantheon"),
-                provider=str(row.get("provider") or "") or _AGGREGATE_ALL_PROVIDERS_SENTINEL,
-                pending_delta=-float(row.get("estimated_cost_usd") or 0.0),
-                committed_delta=actual_cost_usd,
-                window_start_ts=_spend_aggregate_window_start(current),
-                now=current,
+
+async def settle_cost_in_transaction(
+    tx: Any,
+    *,
+    attempt_id: str,
+    actual_cost_usd: float,
+    ledger_id: int | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Settle in the same transaction as a usage-ledger append (crash atomic)."""
+    amount, valid = _normalise_estimated_cost(actual_cost_usd)
+    if not valid:
+        raise CostReservationConflict("invalid actual_cost_usd")
+    current = now or datetime.now(timezone.utc)
+    conn = _conn_from_tx(tx)
+    row = await _locked_attempt(conn, attempt_id, current)
+    if row is None:
+        raise CostReservationConflict(f"unknown attempt_id={attempt_id}")
+    recovery = await _tx_rows(
+        conn,
+        "SELECT attempt_id FROM knemon_cost_recovery WHERE attempt_id = :id",
+        {"id": attempt_id},
+    )
+    if row["status"] == "settled" and not recovery:
+        if float(row["actual_cost_usd"]) != amount:
+            raise CostReservationConflict(
+                f"attempt_id={attempt_id} already settled at different cost"
             )
-            # The unfiltered (provider IS NULL) row needs the same
-            # bookkeeping — both granularities must agree.
-            await _upsert_spend_aggregate_row(
-                conn,
-                caller_subsystem=str(row.get("caller_subsystem") or "pantheon"),
-                provider=_AGGREGATE_ALL_PROVIDERS_SENTINEL,
-                pending_delta=-float(row.get("estimated_cost_usd") or 0.0),
-                committed_delta=actual_cost_usd,
-                window_start_ts=_spend_aggregate_window_start(current),
-                now=current,
+        if ledger_id is None or row["ledger_id"] == ledger_id:
+            return
+        if row["ledger_id"] is not None:
+            raise CostReservationConflict("reservation linked to different ledger row")
+    if ledger_id is not None:
+        linked = await _tx_rows(
+            conn, "SELECT * FROM usage_ledger WHERE id = :id", {"id": ledger_id}
+        )
+        if (
+            not linked
+            or linked[0]["caller_subsystem"] != row["caller_subsystem"]
+            or _canon_provider(linked[0]["provider"]) != row["provider"]
+            or abs(float(linked[0]["est_cost_usd"]) - amount) > 1e-8
+        ):
+            raise CostReservationConflict(
+                "ledger linkage does not match reservation cost and scope"
             )
-        except Exception as exc:  # pragma: no cover — defensive
-            logger.warning(
-                "settle_cost failed to update spend aggregate: %s", exc
-            )
+    # A late bill remains billable even after explicit release raced completion.
+    await _tx_execute(
+        conn,
+        """UPDATE knemon_cost_reservations SET status = 'settled', settled_at = :now_ts, actual_cost_usd = :amount, ledger_id = :ledger_id WHERE attempt_id = :id""",
+        {"now_ts": current, "amount": amount, "ledger_id": ledger_id, "id": attempt_id},
+    )
+    await _tx_execute(
+        conn,
+        "DELETE FROM knemon_cost_recovery WHERE attempt_id = :id",
+        {"id": attempt_id},
+    )
+    await _refresh_attempt_scopes(conn, row, current)
 
 
 async def release_cost(
-    backend: Any,
-    *,
-    attempt_id: str,
-    now: datetime | None = None,
+    backend: Any, *, attempt_id: str, now: datetime | None = None
 ) -> None:
-    """Return the headroom for an aborted reservation.
-
-    F04 contract:
-
-    * Idempotent and safe to call on already-settled or
-      already-released ``attempt_id`` (no-op, not an error). Cleanup
-      code may invoke this defensively without tracking exact state.
-    * Raises only if the persistence backend itself fails — the prior
-      "swallow on failure" behavior was part of the F04 bug.
-    """
+    """Release only attempts known not to have incurred upstream work."""
     current = now or datetime.now(timezone.utc)
     async with backend.transactional() as tx:
         conn = _conn_from_tx(tx)
-        rows = await _tx_rows(
-            conn,
-            """
-            SELECT attempt_id, status, provider, caller_subsystem,
-                   estimated_cost_usd
-            FROM knemon_cost_reservations
-            WHERE attempt_id = :attempt_id
-            """,
-            {"attempt_id": attempt_id},
-        )
-        if not rows:
-            # No reservation — idempotent no-op for callers that release
-            # defensively without a prior reserve.
-            return
-        row = rows[0]
-        status = str(row.get("status") or "")
-        if status != "pending":
-            # Already-settled / released: no-op, do not raise.
+        row = await _locked_attempt(conn, attempt_id, current)
+        if row is None or row["status"] != "pending":
             return
         await _tx_execute(
             conn,
-            """
-            UPDATE knemon_cost_reservations
-            SET status = 'released', released_at = :now_ts
-            WHERE attempt_id = :attempt_id AND status = 'pending'
-            """,
-            {"attempt_id": attempt_id, "now_ts": current},
+            "UPDATE knemon_cost_reservations SET status = 'released', released_at = :now_ts WHERE attempt_id = :id",
+            {"now_ts": current, "id": attempt_id},
         )
-        # Maintain the read-path spend aggregate in the SAME
-        # transaction as the release write. Pending headroom is being
-        # returned, so the pending counter is decremented by the
-        # reservation's estimated cost. Both granularities
-        # (provider-scoped and unfiltered) are updated in lockstep.
-        try:
-            await _upsert_spend_aggregate_row(
-                conn,
-                caller_subsystem=str(row.get("caller_subsystem") or "pantheon"),
-                provider=str(row.get("provider") or "") or _AGGREGATE_ALL_PROVIDERS_SENTINEL,
-                pending_delta=-float(row.get("estimated_cost_usd") or 0.0),
-                window_start_ts=_spend_aggregate_window_start(current),
-                now=current,
-            )
-            await _upsert_spend_aggregate_row(
-                conn,
-                caller_subsystem=str(row.get("caller_subsystem") or "pantheon"),
-                provider=_AGGREGATE_ALL_PROVIDERS_SENTINEL,
-                pending_delta=-float(row.get("estimated_cost_usd") or 0.0),
-                window_start_ts=_spend_aggregate_window_start(current),
-                now=current,
-            )
-        except Exception as exc:  # pragma: no cover — defensive
-            logger.warning(
-                "release_cost failed to update spend aggregate: %s", exc
-            )
+        await _refresh_attempt_scopes(conn, row, current)
 
 
 async def cleanup_cost_reservations(
-    backend: Any,
-    *,
-    now: datetime | None = None,
+    backend: Any, *, now: datetime | None = None
 ) -> None:
-    """Bound reservation history and expire stale pending reservations.
-
-    Drop settled / released rows older than the configured retention.
-    Move stale pending reservations (``expires_at < now``) to
-    ``released`` so a crashed caller doesn't permanently burn
-    headroom. Cleanup is idempotent; multiple processes may call it.
-    """
+    """Charge expired unknown attempts conservatively and retain a full budget window."""
     current = now or datetime.now(timezone.utc)
-    cutoff = current - timedelta(seconds=_cost_reservation_retention_seconds())
+    cutoff = current - timedelta(
+        seconds=max(7 * 86400, _cost_reservation_retention_seconds())
+    )
     async with backend.transactional() as tx:
         conn = _conn_from_tx(tx)
-        await _tx_execute(
+        scopes = await _tx_rows(
             conn,
-            """
-            UPDATE knemon_cost_reservations
-            SET status = 'released', released_at = :now_ts
-            WHERE status = 'pending' AND expires_at < :now_ts
-            """,
-            {"now_ts": current},
+            "SELECT DISTINCT caller_subsystem FROM knemon_cost_reservations ORDER BY caller_subsystem",
         )
-        await _tx_execute(
-            conn,
-            """
-            DELETE FROM knemon_cost_reservations
-            WHERE status IN ('settled', 'released')
-              AND COALESCE(settled_at, released_at, reserved_at) < :cutoff_ts
-            """,
-            {"cutoff_ts": cutoff},
-        )
+        for scope in scopes:
+            await _ensure_and_lock_reservation_lock(
+                conn, scope["caller_subsystem"], current
+            )
+            from mnemos.domain.knemon.router import _row_limited_sql
+
+            expired = await _tx_rows(
+                conn,
+                _row_limited_sql(
+                    f"""SELECT attempt_id FROM knemon_cost_reservations
+                WHERE caller_subsystem = :scope AND status = 'pending'
+                  AND {_time_sql(conn, "expires_at")} <= {_time_sql(conn, ":now_ts")}
+                ORDER BY expires_at""",
+                    _connection_dialect(conn),
+                    500,
+                ),
+                {"scope": scope["caller_subsystem"], "now_ts": current},
+            )
+            for expired_row in expired:
+                params = {"id": expired_row["attempt_id"], "now_ts": current}
+                await _tx_execute(
+                    conn,
+                    "INSERT INTO knemon_cost_recovery(attempt_id) VALUES (:id)",
+                    params,
+                )
+                await _tx_execute(
+                    conn,
+                    """UPDATE knemon_cost_reservations
+                    SET status = 'settled', settled_at = :now_ts, actual_cost_usd = estimated_cost_usd
+                    WHERE attempt_id = :id""",
+                    params,
+                )
+            await _tx_execute(
+                conn,
+                f"""DELETE FROM knemon_cost_reservations WHERE caller_subsystem = :scope AND status IN ('settled', 'released') AND {_time_sql(conn, "COALESCE(settled_at, released_at, reserved_at)")} < {_time_sql(conn, ":cutoff")}""",
+                {"scope": scope["caller_subsystem"], "cutoff": cutoff},
+            )
+            await _tx_execute(
+                conn,
+                """DELETE FROM knemon_cost_recovery
+                WHERE NOT EXISTS (SELECT 1 FROM knemon_cost_reservations r WHERE r.attempt_id = knemon_cost_recovery.attempt_id)""",
+            )
+            providers = await _tx_rows(
+                conn,
+                "SELECT provider FROM knemon_spend_window_aggregates WHERE caller_subsystem = :scope",
+                {"scope": scope["caller_subsystem"]},
+            )
+            for row in providers:
+                await _reconcile_spend_aggregates_tx(
+                    conn,
+                    caller_subsystem=scope["caller_subsystem"],
+                    provider=row["provider"],
+                    now=current,
+                )
 
 
 # ---------------------------------------------------------------------------
-# Read-path spend aggregate
-#
-# Every admission check (and every dashboard refresh) re-sums the rolling
-# 7-day ``usage_ledger`` plus outstanding pending reservations. That
-# re-scan grows with the ledger and turns a budget check into an O(N)
-# operation that itself becomes a hot-path race window. The aggregate
-# table below (``knemon_spend_window_aggregates``) is a small maintained
-# counter that ``settle_cost`` / ``release_cost`` / ``reserve_cost``
-# update incrementally so the read path is O(1) on cache hit.
-#
-# Reconciliation: ``reconcile_spend_aggregates`` rebuilds the row(s) from
-# scratch using a fresh full-scan SUM of the underlying ledger +
-# reservations tables and verifies the maintained counter matches. The
-# drift check is the safety net — the maintained counter is allowed to
-# drift forward (incremental updates are eventually consistent) but the
-# reconciliation surfaces any discrepancy the caller can correct before
-# poisoning the budget math.
+# Reporting snapshots. Mutable/legacy ledger writers and rolling expiry require
+# authoritative reconciliation; these rows are not a money-admission shortcut.
 # ---------------------------------------------------------------------------
 
 
@@ -1202,25 +1172,31 @@ async def _upsert_spend_aggregate_row(
         "last_updated_at": current,
     }
     if dialect in {"postgres", "sqlite"}:
+        floor = "GREATEST" if dialect == "postgres" else "MAX"
+        timestamp = (
+            "CAST(:last_updated_at AS TIMESTAMPTZ)"
+            if dialect == "postgres"
+            else ":last_updated_at"
+        )
         await _tx_execute(
             conn,
-            """
+            f"""
             INSERT INTO knemon_spend_window_aggregates (
                 caller_subsystem, provider, window_start_ts,
                 committed_usd, pending_usd,
                 last_reconciled_at, last_updated_at
             ) VALUES (
                 :caller_subsystem, :provider, :window_start_ts,
-                MAX(0, :committed_delta), MAX(0, :pending_delta),
-                CASE WHEN :reconciled THEN :last_updated_at ELSE NULL END,
+                {floor}(0, :committed_delta), {floor}(0, :pending_delta),
+                CASE WHEN :reconciled THEN {timestamp} ELSE NULL END,
                 :last_updated_at
             )
             ON CONFLICT (caller_subsystem, provider) DO UPDATE
-            SET committed_usd = MAX(0, knemon_spend_window_aggregates.committed_usd + :committed_delta),
-                pending_usd   = MAX(0, knemon_spend_window_aggregates.pending_usd + :pending_delta),
+            SET committed_usd = {floor}(0, knemon_spend_window_aggregates.committed_usd + :committed_delta),
+                pending_usd   = {floor}(0, knemon_spend_window_aggregates.pending_usd + :pending_delta),
                 window_start_ts = :window_start_ts,
                 last_reconciled_at = CASE
-                    WHEN :reconciled THEN :last_updated_at
+                    WHEN :reconciled THEN {timestamp}
                     ELSE knemon_spend_window_aggregates.last_reconciled_at
                 END,
                 last_updated_at = :last_updated_at
@@ -1274,9 +1250,7 @@ async def _upsert_spend_aggregate_row(
             0.0,
             _to_float(row.get("committed_usd"), 0.0) + committed_delta,
         )
-        new_pending = max(
-            0.0, _to_float(row.get("pending_usd"), 0.0) + pending_delta
-        )
+        new_pending = max(0.0, _to_float(row.get("pending_usd"), 0.0) + pending_delta)
         reconciled_at_clause = (
             "last_reconciled_at = :last_updated_at"
             if reconciled
@@ -1334,20 +1308,6 @@ async def _upsert_spend_aggregate_row(
     )
 
 
-# NOTE: the canonical aggregate-maintenance path is the INLINE
-# ``_upsert_spend_aggregate_row`` calls inside ``reserve_cost``,
-# ``settle_cost``, and ``release_cost`` themselves. They keep the
-# counter update co-located with the source-of-truth write so a
-# reviewer can audit the exact transition (delta sign, scope, sign of
-# the pending-vs-committed swap on settle) at the point it happens.
-# Earlier drafts introduced ``_record_committed_spend`` /
-# ``_record_pending_reservation`` / ``_record_reservation_release``
-# helpers that were never actually called — they confused the data
-# flow without adding value, so they have been removed. If you find
-# yourself reaching for them, that is a smell: the inline calls are
-# the contract.
-
-
 async def effective_spend_usd_aggregate(
     backend: Any,
     *,
@@ -1356,25 +1316,18 @@ async def effective_spend_usd_aggregate(
     now: datetime | None = None,
     allow_reconcile: bool = True,
 ) -> float:
-    """Cached effective-spend read served from the maintained aggregate.
+    """Read a reporting snapshot, reconciling when its rolling boundary changes.
 
-    Returns the maintained counter's committed + pending value when
-    the cached window still covers ``now`` (i.e. the row's
-    ``window_start_ts`` is greater than or equal to the lower bound
-    for ``now``). Otherwise rebuilds the row from a fresh full-scan
-    SUM of the ledger + outstanding reservations and returns the
-    refreshed value.
-
-    This is the O(1) read path the F04 review called out: admission
-    checks call ``effective_spend_usd`` which sums the ledger from
-    scratch on every call; this function returns the same number from
-    the small aggregate table on the hot path.
+    This function is not the admission authority. Legacy ledger writes can
+    bypass aggregate maintenance; callers needing current enforceable spend
+    use effective_spend_usd or the atomic reserve_cost operation.
     """
     current = now or datetime.now(timezone.utc)
     target_window_start = _spend_aggregate_window_start(current)
     provider_key = _aggregate_provider_key(provider)
     async with backend.transactional() as tx:
         conn = _conn_from_tx(tx)
+        await _ensure_and_lock_reservation_lock(conn, caller_subsystem, current)
         rows = await _tx_rows(
             conn,
             """
@@ -1391,11 +1344,8 @@ async def effective_spend_usd_aggregate(
             # Stale if the row's window_start_ts is older than the
             # lower bound we want for ``now``. NOTE: ``_to_float``
             # doesn't apply to datetimes, so check identity directly.
-            if (
-                cached_window_start is not None
-                and not _is_aggregate_window_stale(
-                    cached_window_start, target_window_start
-                )
+            if cached_window_start is not None and not _is_aggregate_window_stale(
+                cached_window_start, target_window_start
             ):
                 return float(
                     _to_float(row.get("committed_usd"), 0.0)
@@ -1403,7 +1353,9 @@ async def effective_spend_usd_aggregate(
                 )
 
         if not allow_reconcile:
-            return 0.0
+            raise RuntimeError(
+                "spend aggregate missing or stale; authoritative reconciliation required"
+            )
 
         # Stale (or missing): rebuild from scratch, write the row,
         # and return the fresh value.
@@ -1431,7 +1383,9 @@ async def effective_spend_usd_aggregate(
         )
 
 
-def _is_aggregate_window_stale(cached_window_start: Any, target_window_start: datetime) -> bool:
+def _is_aggregate_window_stale(
+    cached_window_start: Any, target_window_start: datetime
+) -> bool:
     """Return True when the cached aggregate's window lower-bound is older than ``target``.
 
     The aggregate row is considered stale when its window starts
@@ -1469,114 +1423,24 @@ async def _reconcile_spend_aggregates_tx(
     provider: str | None,
     now: datetime,
 ) -> None:
-    """Rebuild the aggregate row from a fresh full-scan SUM.
-
-    Writes (provider IS NULL) AND (provider = :provider) rows in the
-    same transaction so callers at either granularity see a coherent
-    value.
-    """
+    """Rebuild exactly the requested scope under its caller-subsystem lock."""
     window_start = _spend_aggregate_window_start(now)
-
-    # KNEMON's committed spend lives in TWO tables: ``usage_ledger``
-    # is the historical ledger (pre-F04 callers), and
-    # ``knemon_cost_reservations`` carries the F04 ``actual_cost_usd``
-    # for settled reservations. The aggregate must equal the SUM
-    # across both sources — a single source would silently drop
-    # whichever path a given caller uses.
-    committed_params: dict[str, Any] = {
-        "caller_subsystem": caller_subsystem,
-        "since_ts": window_start,
-    }
-    committed_provider_clause = ""
-    if provider:
-        committed_provider_clause = "AND LOWER(provider) = :provider"
-        committed_params["provider"] = provider
-    ledger_rows = await _tx_rows(
+    committed, pending = await _spend_components_tx(
         conn,
-        f"""
-        SELECT COALESCE(SUM(est_cost_usd), 0) AS committed_usd
-        FROM usage_ledger
-        WHERE caller_subsystem = :caller_subsystem
-          AND ts >= :since_ts
-          {committed_provider_clause}
-        """,
-        committed_params,
+        caller_subsystem=caller_subsystem,
+        provider=provider,
+        now=now,
+        since=window_start,
     )
-    ledger_committed = _to_float(
-        (ledger_rows[0] if ledger_rows else {}).get("committed_usd"),
-        0.0,
-    )
-
-    settled_reservation_params: dict[str, Any] = {
-        "caller_subsystem": caller_subsystem,
-        "since_ts": window_start,
-    }
-    settled_reservation_provider_clause = ""
-    if provider:
-        settled_reservation_provider_clause = "AND LOWER(provider) = :provider"
-        settled_reservation_params["provider"] = provider
-    settled_rows = await _tx_rows(
+    await _absorb_aggregate_absolute(
         conn,
-        f"""
-        SELECT COALESCE(SUM(actual_cost_usd), 0) AS settled_usd
-        FROM knemon_cost_reservations
-        WHERE status = 'settled'
-          AND caller_subsystem = :caller_subsystem
-          AND settled_at >= :since_ts
-          {settled_reservation_provider_clause}
-        """,
-        settled_reservation_params,
+        caller_subsystem=caller_subsystem,
+        provider=_aggregate_provider_key(provider),
+        committed_usd=committed,
+        pending_usd=pending,
+        window_start_ts=window_start,
+        now=now,
     )
-    settled_committed = _to_float(
-        (settled_rows[0] if settled_rows else {}).get("settled_usd"),
-        0.0,
-    )
-    committed = ledger_committed + settled_committed
-
-    pending_params: dict[str, Any] = {
-        "caller_subsystem": caller_subsystem,
-        "now_ts": now,
-    }
-    pending_provider_clause = ""
-    if provider:
-        pending_provider_clause = "AND LOWER(provider) = :provider"
-        pending_params["provider"] = provider
-    pending_rows = await _tx_rows(
-        conn,
-        f"""
-        SELECT COALESCE(SUM(estimated_cost_usd), 0) AS pending_usd
-        FROM knemon_cost_reservations
-        WHERE status = 'pending'
-          AND caller_subsystem = :caller_subsystem
-          AND expires_at > :now_ts
-          {pending_provider_clause}
-        """,
-        pending_params,
-    )
-    pending = _to_float(
-        (pending_rows[0] if pending_rows else {}).get("pending_usd"),
-        0.0,
-    )
-
-    # Write the ABSOLUTE counter for each scope. We do this by reading
-    # the current row first (which we just SELECT-FOR-UPDATE'd above in
-    # the caller if needed) and then writing the absolute values. For
-    # backends that support UPSERT we use that to set the row directly;
-    # for others we delete-and-insert.
-    scopes = (
-        _aggregate_provider_key(provider),
-        _AGGREGATE_ALL_PROVIDERS_SENTINEL,
-    )
-    for scope in scopes:
-        await _absorb_aggregate_absolute(
-            conn,
-            caller_subsystem=caller_subsystem,
-            provider=scope,
-            committed_usd=committed,
-            pending_usd=pending,
-            window_start_ts=window_start,
-            now=now,
-        )
 
 
 async def _absorb_aggregate_absolute(
@@ -1713,8 +1577,7 @@ class AggregateDriftReport:
     @property
     def has_drift(self) -> bool:
         return (
-            abs(self.committed_drift_usd) > 1e-9
-            or abs(self.pending_drift_usd) > 1e-9
+            abs(self.committed_drift_usd) > 1e-9 or abs(self.pending_drift_usd) > 1e-9
         )
 
 
@@ -1782,11 +1645,9 @@ async def reconcile_spend_aggregates(
     # compare against the literal sentinel string ``'*'`` and silently
     # match zero rows.
     provider_key = _aggregate_provider_key(provider)
-    fresh_provider_filter = (
-        provider.strip().lower() if provider else None
-    )
     async with backend.transactional() as tx:
         conn = _conn_from_tx(tx)
+        await _ensure_and_lock_reservation_lock(conn, caller_subsystem, current)
 
         # Snapshot what the maintained counter says BEFORE we rebuild,
         # so the drift report has a meaningful before/after pair.
@@ -1802,112 +1663,28 @@ async def reconcile_spend_aggregates(
         )
         if snapshot_rows:
             snapshot = snapshot_rows[0]
-            maintained_committed = _to_float(
-                snapshot.get("committed_usd"), 0.0
-            )
+            maintained_committed = _to_float(snapshot.get("committed_usd"), 0.0)
             maintained_pending = _to_float(snapshot.get("pending_usd"), 0.0)
         else:
             maintained_committed = 0.0
             maintained_pending = 0.0
 
-        # Fresh full-scan SUM (this is what the read path would have
-        # returned if the aggregate did not exist). The provider filter
-        # comes from the original Python ``provider`` argument
-        # (``None`` = unfiltered), NOT from the aggregate primary-key
-        # sentinel — otherwise the SUM would compare against the literal
-        # ``'*'`` row and miss every real provider.
-        committed_params: dict[str, Any] = {
-            "caller_subsystem": caller_subsystem,
-            "since_ts": window_start,
-        }
-        committed_provider_clause = ""
-        if fresh_provider_filter:
-            committed_provider_clause = "AND LOWER(provider) = :provider"
-            committed_params["provider"] = fresh_provider_filter
-        committed_rows = await _tx_rows(
+        fresh_committed, fresh_pending = await _spend_components_tx(
             conn,
-            f"""
-            SELECT COALESCE(SUM(est_cost_usd), 0) AS committed_usd
-            FROM usage_ledger
-            WHERE caller_subsystem = :caller_subsystem
-              AND ts >= :since_ts
-              {committed_provider_clause}
-            """,
-            committed_params,
+            caller_subsystem=caller_subsystem,
+            provider=provider,
+            now=current,
+            since=window_start,
         )
-        ledger_committed = _to_float(
-            (committed_rows[0] if committed_rows else {}).get(
-                "committed_usd"
-            ),
-            0.0,
-        )
-
-        # Settled F04 reservations carry their own ``actual_cost_usd``
-        # (the post-call cost the caller recorded). The reconciliation
-        # sums both sources so the rebuilt counter agrees with
-        # ``effective_spend_usd`` no matter which write path the
-        # caller used.
-        settled_reservation_params: dict[str, Any] = dict(committed_params)
-        settled_rows = await _tx_rows(
+        await _absorb_aggregate_absolute(
             conn,
-            f"""
-            SELECT COALESCE(SUM(actual_cost_usd), 0) AS settled_usd
-            FROM knemon_cost_reservations
-            WHERE status = 'settled'
-              AND caller_subsystem = :caller_subsystem
-              AND settled_at >= :since_ts
-              {committed_provider_clause}
-            """,
-            settled_reservation_params,
+            caller_subsystem=caller_subsystem,
+            provider=provider_key,
+            committed_usd=fresh_committed,
+            pending_usd=fresh_pending,
+            window_start_ts=window_start,
+            now=current,
         )
-        settled_committed = _to_float(
-            (settled_rows[0] if settled_rows else {}).get("settled_usd"),
-            0.0,
-        )
-        fresh_committed = ledger_committed + settled_committed
-
-        pending_params: dict[str, Any] = {
-            "caller_subsystem": caller_subsystem,
-            "now_ts": current,
-        }
-        pending_provider_clause = ""
-        if fresh_provider_filter:
-            pending_provider_clause = "AND LOWER(provider) = :provider"
-            pending_params["provider"] = fresh_provider_filter
-        pending_rows = await _tx_rows(
-            conn,
-            f"""
-            SELECT COALESCE(SUM(estimated_cost_usd), 0) AS pending_usd
-            FROM knemon_cost_reservations
-            WHERE status = 'pending'
-              AND caller_subsystem = :caller_subsystem
-              AND expires_at > :now_ts
-              {pending_provider_clause}
-            """,
-            pending_params,
-        )
-        fresh_pending = _to_float(
-            (pending_rows[0] if pending_rows else {}).get("pending_usd"),
-            0.0,
-        )
-
-        # Rebuild the row(s) — both the provider-scoped one and the
-        # unfiltered one, so a future ``provider=None`` admission
-        # check also has a fresh counter.
-        scopes = (
-            provider_key,
-            _AGGREGATE_ALL_PROVIDERS_SENTINEL,
-        )
-        for scope in scopes:
-            await _absorb_aggregate_absolute(
-                conn,
-                caller_subsystem=caller_subsystem,
-                provider=scope,
-                committed_usd=fresh_committed,
-                pending_usd=fresh_pending,
-                window_start_ts=window_start,
-                now=current,
-            )
 
         drift = AggregateDriftReport(
             caller_subsystem=caller_subsystem,
