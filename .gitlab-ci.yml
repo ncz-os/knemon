@@ -26,7 +26,7 @@ pytest:
   variables:
     POSTGRES_PASSWORD: test-only
     POSTGRES_DB: mnemos_test
-    MNEMOS_TEST_DB: "postgresql://postgres:test-only@postgres:5432/mnemos_test"
+    KNEMON_TEST_POSTGRES_DSN: "postgresql://postgres:test-only@postgres:5432/mnemos_test"
   before_script:
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends git build-essential cmake
     - git clone https://gitlab.com/ncz-os/mnemos.git ../mnemos-core
