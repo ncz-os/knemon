@@ -11,7 +11,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "MNEMOS Contributors" }]
 maintainers = [{ name = "Jason Perlow", email = "jperlow@gmail.com" }]
 requires-python = ">=3.13"
-dependencies = ["mnemos-core>=6.2,<7", "fastapi"]
+dependencies = ["mnemos-core>=6.2,<8", "fastapi"]
 
 [dependency-groups]
 # F04: pytest + pytest-asyncio are required by the validation command
