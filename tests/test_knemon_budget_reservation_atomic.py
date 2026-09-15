@@ -25,7 +25,6 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-
 from mnemos.domain.knemon import budget as B
 from mnemos.domain.knemon.budget import (
     CostReservationConflict,
@@ -38,7 +37,6 @@ from mnemos.domain.knemon.budget import (
     settle_cost,
 )
 from mnemos.domain.knemon.migrations import ensure_knemon_schema
-
 
 # ---------------------------------------------------------------------------
 # In-memory backend with the F04 schema pre-applied
@@ -75,6 +73,7 @@ class _ReserveBackend:
         with self._acquire_cursor() as cur:
             cur.executescript(
                 """
+                CREATE TABLE knemon_cost_recovery (attempt_id TEXT PRIMARY KEY);
                 CREATE TABLE knemon_cost_reservations (
                     attempt_id TEXT PRIMARY KEY,
                     provider TEXT NOT NULL,
@@ -159,7 +158,12 @@ class _ReserveBackend:
             self._conn.execute(
                 "INSERT INTO usage_ledger (ts, session_id, request_count, provider, caller_subsystem, est_cost_usd) "
                 "VALUES (?, NULL, 1, ?, ?, ?)",
-                (datetime.now(timezone.utc).isoformat(), provider, caller_subsystem, amount_usd),
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    provider,
+                    caller_subsystem,
+                    amount_usd,
+                ),
             )
             self._conn.commit()
 
@@ -433,13 +437,20 @@ async def test_reserve_cost_settle_then_admission_reflects_actual(backend):
     assert isinstance(first, ReservationHandle)
     # Real cost came in at $1.50 — settle and the difference is freed.
     await settle_cost(backend, attempt_id="first-call", actual_cost_usd=1.50)
-    # After settle the row is no longer pending; pending math drops it,
-    # so a $4 follow-up reservation is admitted.
+    # Actual spend remains counted; only $3.50 of the $5 cap is available.
+    with pytest.raises(B.CostReservationConflict):
+        await reserve_cost(
+            backend,
+            provider="openai",
+            model="gpt-4o",
+            estimated_cost_usd=4.0,
+            attempt_id="over-cap",
+        )
     second = await reserve_cost(
         backend,
         provider="openai",
         model="gpt-4o",
-        estimated_cost_usd=4.0,
+        estimated_cost_usd=3.5,
         attempt_id="after-settle",
         caller_subsystem="pantheon",
     )
@@ -739,7 +750,9 @@ async def test_evaluate_usage_budget_counts_pending_reservations(backend):
 
 
 @pytest.mark.asyncio
-async def test_reserve_budget_pending_reservations_excludes_settled_and_released(backend):
+async def test_reserve_budget_pending_reservations_excludes_settled_and_released(
+    backend,
+):
     """Settled / released reservations must NOT count against the cap."""
     _reset_db_migration_cache()
     B.get_settings = lambda: SimpleNamespace(  # type: ignore[assignment]
@@ -842,7 +855,9 @@ async def test_reserve_budget_cleanup_expires_stale_pending(backend):
 
     await cleanup_cost_reservations(backend, now=future)
     rows = backend.reservation_rows(caller_subsystem="pantheon")
-    assert rows[0]["status"] == "released"
+    assert rows[0]["status"] == "settled"
+    assert rows[0]["actual_cost_usd"] == 2.0
+    assert await B.effective_spend_usd(backend, now=future) == 2.0
 
 
 # ---------------------------------------------------------------------------

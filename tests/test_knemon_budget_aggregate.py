@@ -32,13 +32,12 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
-import uuid
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
-
 from mnemos.domain.knemon import budget as B
 from mnemos.domain.knemon.budget import (
     AggregateDriftReport,
@@ -88,13 +87,14 @@ async def _fresh_spend_usd(
                 params.append(provider.strip().lower())
             cur.execute(
                 "SELECT COALESCE(SUM(est_cost_usd), 0) FROM usage_ledger "
-                "WHERE caller_subsystem = ? AND ts >= ? " + provider_clause,
+                "WHERE caller_subsystem = ? AND julianday(ts) >= julianday(?) "
+                + provider_clause,
                 tuple(params),
             )
             ledger_committed = float(cur.fetchone()[0] or 0.0)
             cur.execute(
                 "SELECT COALESCE(SUM(actual_cost_usd), 0) FROM knemon_cost_reservations "
-                "WHERE status = 'settled' AND caller_subsystem = ? AND settled_at >= ? "
+                "WHERE status = 'settled' AND caller_subsystem = ? AND julianday(settled_at) >= julianday(?) "
                 + provider_clause,
                 tuple(params),
             )
@@ -140,6 +140,7 @@ class _AggregateBackend:
         with self._acquire_cursor() as cur:
             cur.executescript(
                 """
+                CREATE TABLE knemon_cost_recovery (attempt_id TEXT PRIMARY KEY);
                 CREATE TABLE knemon_cost_reservations (
                     attempt_id TEXT PRIMARY KEY,
                     provider TEXT NOT NULL,
@@ -353,9 +354,7 @@ class _AggregateBackend:
                 cur.close()
             self._conn.commit()
 
-    def ledger_rows(
-        self, *, caller_subsystem: str | None = None
-    ) -> list[dict]:
+    def ledger_rows(self, *, caller_subsystem: str | None = None) -> list[dict]:
         with self._lock:
             cur = self._conn.cursor()
             try:
@@ -375,9 +374,7 @@ class _AggregateBackend:
             finally:
                 cur.close()
 
-    def reservation_rows(
-        self, *, caller_subsystem: str | None = None
-    ) -> list[dict]:
+    def reservation_rows(self, *, caller_subsystem: str | None = None) -> list[dict]:
         with self._lock:
             cur = self._conn.cursor()
             try:
@@ -397,9 +394,7 @@ class _AggregateBackend:
             finally:
                 cur.close()
 
-    def aggregate_rows(
-        self, *, caller_subsystem: str | None = None
-    ) -> list[dict]:
+    def aggregate_rows(self, *, caller_subsystem: str | None = None) -> list[dict]:
         with self._lock:
             cur = self._conn.cursor()
             try:
@@ -502,13 +497,13 @@ def _fresh_ledger_spend_usd(
             # form sqlite3 stores and yields zero rows.
             cur.execute(
                 "SELECT COALESCE(SUM(est_cost_usd), 0) FROM usage_ledger "
-                "WHERE caller_subsystem = ? AND ts >= ?",
+                "WHERE caller_subsystem = ? AND julianday(ts) >= julianday(?)",
                 (caller_subsystem, since),
             )
             ledger_committed = float(cur.fetchone()[0] or 0.0)
             cur.execute(
                 "SELECT COALESCE(SUM(actual_cost_usd), 0) FROM knemon_cost_reservations "
-                "WHERE status = 'settled' AND caller_subsystem = ? AND settled_at >= ?",
+                "WHERE status = 'settled' AND caller_subsystem = ? AND julianday(settled_at) >= julianday(?)",
                 (caller_subsystem, since),
             )
             settled_committed = float(cur.fetchone()[0] or 0.0)
@@ -633,9 +628,7 @@ async def test_reconcile_spend_aggregates_reports_zero_drift(backend):
             caller_subsystem=caller,
             now=now,
         )
-        await settle_cost(
-            backend, attempt_id=attempt, actual_cost_usd=0.5, now=now
-        )
+        await settle_cost(backend, attempt_id=attempt, actual_cost_usd=0.5, now=now)
 
     reports = await reconcile_spend_aggregates(
         backend, caller_subsystem=caller, provider=None, now=now
@@ -703,24 +696,16 @@ async def test_aggregate_drops_old_spend_after_window_rollover(backend):
             caller_subsystem=caller,
             now=now,
         )
-        await settle_cost(
-            backend, attempt_id=attempt, actual_cost_usd=2.0, now=now
-        )
+        await settle_cost(backend, attempt_id=attempt, actual_cost_usd=2.0, now=now)
 
     # Sanity: pre-rollover, the aggregate reports 6 USD and matches
     # the fresh ledger SUM.
-    assert (
-        await effective_spend_usd_aggregate(
-            backend, caller_subsystem=caller, provider=None, now=now
-        )
-        == pytest.approx(6.0)
-    )
-    assert (
-        await _fresh_spend_usd(
-            backend, caller_subsystem=caller, provider=None, now=now
-        )
-        == pytest.approx(6.0)
-    )
+    assert await effective_spend_usd_aggregate(
+        backend, caller_subsystem=caller, provider=None, now=now
+    ) == pytest.approx(6.0)
+    assert await _fresh_spend_usd(
+        backend, caller_subsystem=caller, provider=None, now=now
+    ) == pytest.approx(6.0)
 
     # Rewrite the ledger rows so they fall OUTSIDE the rolling
     # window. The aggregate's incremental counter would otherwise
@@ -728,9 +713,7 @@ async def test_aggregate_drops_old_spend_after_window_rollover(backend):
     # decrement; this is the failure mode the F04 review warned
     # about. The reconciliation must correct it.
     aged = now - timedelta(hours=2)
-    backend.update_ledger_ts_for_test(
-        caller_subsystem=caller, new_ts=aged
-    )
+    backend.update_ledger_ts_for_test(caller_subsystem=caller, new_ts=aged)
     # The aggregate's reconciliation also SUMs
     # ``knemon_cost_reservations.settled_at`` (F04-settled spend is
     # tracked in the reservations table, not the ledger). Aging out
@@ -790,9 +773,7 @@ async def test_aggregate_keeps_in_window_spend_after_window_rollover(backend):
             caller_subsystem=caller,
             now=now,
         )
-        await settle_cost(
-            backend, attempt_id=attempt, actual_cost_usd=1.0, now=now
-        )
+        await settle_cost(backend, attempt_id=attempt, actual_cost_usd=1.0, now=now)
 
     # Two more events that we will age OUT of the window.
     for i in range(2):
@@ -806,9 +787,7 @@ async def test_aggregate_keeps_in_window_spend_after_window_rollover(backend):
             caller_subsystem=caller,
             now=now,
         )
-        await settle_cost(
-            backend, attempt_id=attempt, actual_cost_usd=3.0, now=now
-        )
+        await settle_cost(backend, attempt_id=attempt, actual_cost_usd=3.0, now=now)
 
     # Move the "drop" rows out of the window.
     aged = now - timedelta(hours=2)
@@ -868,9 +847,7 @@ async def test_provider_scoped_aggregate_matches_provider_filter(backend):
             caller_subsystem=caller,
             now=now,
         )
-        await settle_cost(
-            backend, attempt_id=attempt, actual_cost_usd=1.0, now=now
-        )
+        await settle_cost(backend, attempt_id=attempt, actual_cost_usd=1.0, now=now)
 
     # Spend against anthropic.
     for i in range(2):
@@ -884,9 +861,7 @@ async def test_provider_scoped_aggregate_matches_provider_filter(backend):
             caller_subsystem=caller,
             now=now,
         )
-        await settle_cost(
-            backend, attempt_id=attempt, actual_cost_usd=2.5, now=now
-        )
+        await settle_cost(backend, attempt_id=attempt, actual_cost_usd=2.5, now=now)
 
     # Unfiltered (provider=None): both totals = 3*1 + 2*2.5 = 8.
     unfiltered_agg = await effective_spend_usd_aggregate(

@@ -75,3 +75,41 @@ supported by our open-source infrastructure partners:
   [Buildkite Open Source](https://buildkite.com/pricing) program.
 
 Thank you to both for backing open-source software.
+
+
+## Monetary attempt reservations
+
+Python 3.13 or newer is required. Development dependency resolution uses the
+real `../mnemos-core` checkout; it never substitutes a metadata-only core.
+
+PANTHEON and GRAEAE use `mnemos.domain.knemon.attempts.Attempt` at the actual
+upstream boundary. Each retry, fallback, and consultation participant has its
+own reservation. Global and provider caps are enforced within the caller
+subsystem (`pantheon` or `graeae`); these are separate accounting scopes, not an
+account-wide sum across every MNEMOS component. Aliases in both configured caps
+and recorded providers normalize to one key; duplicate alias caps use the
+smaller amount. Provider/model prices must be known when a cap is configured.
+
+Admission locks a durable subsystem row before reading committed plus pending
+exposure and inserting a reservation. Ledger append and settlement share one
+transaction. Unlinked settlement retains cost if ledger recording fails.
+Repeated finalization is idempotent, changed attempt payloads are rejected, and
+expired attempts remain counted. Recovery settles at the reserved estimate,
+with provenance so authoritative late usage can correct it. Recovery runs at
+most every 30 seconds per active backend during provider admission and handles
+up to 500 expired attempts per subsystem per pass. Terminal history is retained
+for at least the seven-day budget window. A known pre-dispatch abort can use
+`release_cost`; ambiguous provider failures must be settled conservatively.
+
+Migration `0056_knemon_cost_recovery.sql` adds recovery provenance and rolling
+spend indexes for PostgreSQL, SQLite, MySQL/MariaDB, Oracle, and Db2. SQLite
+compares parsed dates so ISO timestamps using either `T` or a space have the
+same semantics. PostgreSQL and SQLite are exercised with live disposable
+engines; the other dialects have SQL-shape/migration checks, not live qualification.
+
+The aggregate table is a reporting snapshot. Hard admission uses indexed
+seven-day SUM queries plus pending exposure, not a stale cached balance. Work
+still grows with activity in that window and subsystem admissions serialize;
+large installations should measure lock wait and query latency before choosing
+partitioning or a bucketed accounting design. This release makes no O(1)
+admission guarantee.

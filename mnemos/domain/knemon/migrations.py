@@ -11,12 +11,12 @@ import asyncio
 from importlib.resources import files
 from typing import Any
 
-
 MIGRATION_NAMES = (
     "0052_knemon_burn_reservations.sql",
     "0053_knemon_ledger_principals.sql",
     "0054_knemon_cost_reservations.sql",
     "0055_knemon_spend_aggregates.sql",
+    "0056_knemon_cost_recovery.sql",
 )
 # Backward-compatible name retained for integrations that imported it.
 MIGRATION_NAME = MIGRATION_NAMES[0]
@@ -89,11 +89,15 @@ async def ensure_knemon_schema(backend: Any) -> None:
             dialect = _connection_dialect(conn)
             if dialect not in {"postgres", "sqlite", "mysql", "oracle", "db2"}:
                 raise RuntimeError(f"unsupported KNEMON migration backend: {dialect}")
-            directory = "migrations_mariadb" if dialect == "mysql" else f"migrations_{dialect}"
+            directory = (
+                "migrations_mariadb" if dialect == "mysql" else f"migrations_{dialect}"
+            )
             if dialect == "postgres":
                 directory = "migrations"
             for migration_name in MIGRATION_NAMES:
-                resource = files("mnemos.domain.knemon.db_migrations").joinpath(directory, migration_name)
+                resource = files("mnemos.domain.knemon.db_migrations").joinpath(
+                    directory, migration_name
+                )
                 sql = resource.read_text(encoding="utf-8")
                 for statement in _statements(sql, dialect):
                     try:
@@ -101,7 +105,8 @@ async def ensure_knemon_schema(backend: Any) -> None:
                     except Exception as exc:
                         message = str(exc).lower()
                         if dialect == "mysql" and (
-                            getattr(exc, "errno", None) == 1061 or "duplicate key name" in message
+                            getattr(exc, "errno", None) == 1061
+                            or "duplicate key name" in message
                         ):
                             continue
                         raise

@@ -1,4 +1,4 @@
-# GitLab CI — Python "real errors" gate (ruff, high-signal rules only).
+# GitLab CI — high-signal lint and executable regression suites.
 # GitLab SaaS shared runners (free OSS minutes), no fleet CPU. Catches syntax
 # errors + undefined names (E9,F63,F7,F82); stylistic/style-of-imports rules
 # (E402/E501, unused imports) are intentionally NOT gated here — tighten per repo
@@ -13,6 +13,31 @@ ruff:
     - pip install --quiet ruff
   script:
     - ruff check --select E9,F63,F7,F82 --output-format=concise .
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+pytest:
+  stage: check
+  image: python:3.13-slim
+  services:
+    - name: postgres:17
+      alias: postgres
+  variables:
+    POSTGRES_PASSWORD: test-only
+    POSTGRES_DB: mnemos_test
+    KNEMON_TEST_POSTGRES_DSN: "postgresql://postgres:test-only@postgres:5432/mnemos_test"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git build-essential cmake
+    - git clone https://gitlab.com/ncz-os/mnemos.git ../mnemos-core
+    - git -C ../mnemos-core checkout 811a2bc2f33d80ca0c2ca9b6fd5696bd681d86b1
+    - git clone https://gitlab.com/ncz-os/graeae.git ../graeae
+    - git -C ../graeae checkout 55296e2555c6376ed977e03135909f23d3b89bac
+    - git clone https://gitlab.com/ncz-os/pantheon.git ../pantheon
+    - git -C ../pantheon checkout 2ee5bd9cb79e614eebb3535562acdee4c3dcdd03
+    - python -m pip install --quiet -e ../mnemos-core -e ../graeae -e ../pantheon -e "." pytest pytest-asyncio aiosqlite
+  script:
+    - python -m pytest tests/ -q
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_PIPELINE_SOURCE == "push"'
