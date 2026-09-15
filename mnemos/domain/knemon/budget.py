@@ -1334,109 +1334,18 @@ async def _upsert_spend_aggregate_row(
     )
 
 
-async def _record_committed_spend(
-    conn: Any,
-    *,
-    caller_subsystem: str,
-    provider: str | None,
-    actual_cost_usd: float,
-    now: datetime,
-) -> None:
-    """Increment the committed counter for one ``settle_cost`` call.
-
-    NOTE: this helper joins an already-open ``backend.transactional()``
-    block (the same one ``settle_cost`` opened for the reservation
-    write). It MUST NOT open its own transaction — nesting
-    ``backend.transactional()`` blocks fails on sqlite3 with
-    ``cannot start a transaction within a transaction`` and silently
-    leaves the inner counter delta outside the durability boundary on
-    other backends.
-
-    The caller (``settle_cost``) is responsible for opening and
-    committing the outer transaction. ``reconcile_spend_aggregates``
-    remains the safety net: any drift between this delta and the
-    fresh SUM is surfaced the next time a read-path admission check
-    rebuilds the row.
-    """
-    if actual_cost_usd <= 0:
-        return
-    scopes = (
-        _aggregate_provider_key(provider),
-        _AGGREGATE_ALL_PROVIDERS_SENTINEL,
-    )
-    for scope in scopes:
-        await _upsert_spend_aggregate_row(
-            conn,
-            caller_subsystem=caller_subsystem,
-            provider=scope,
-            committed_delta=actual_cost_usd,
-            window_start_ts=_spend_aggregate_window_start(now),
-            now=now,
-        )
-
-
-async def _record_pending_reservation(
-    conn: Any,
-    *,
-    caller_subsystem: str,
-    provider: str | None,
-    estimated_cost_usd: float,
-    now: datetime,
-) -> None:
-    """Increment the pending counter for one ``reserve_cost`` call.
-
-    Joins the outer ``backend.transactional()`` block the same way
-    ``_record_committed_spend`` does — see that function's docstring
-    for the rationale. Do NOT introduce a nested ``transactional()``
-    here.
-    """
-    if estimated_cost_usd <= 0:
-        return
-    scopes = (
-        _aggregate_provider_key(provider),
-        _AGGREGATE_ALL_PROVIDERS_SENTINEL,
-    )
-    for scope in scopes:
-        await _upsert_spend_aggregate_row(
-            conn,
-            caller_subsystem=caller_subsystem,
-            provider=scope,
-            pending_delta=estimated_cost_usd,
-            window_start_ts=_spend_aggregate_window_start(now),
-            now=now,
-        )
-
-
-async def _record_reservation_release(
-    conn: Any,
-    *,
-    caller_subsystem: str,
-    provider: str | None,
-    estimated_cost_usd: float,
-    now: datetime,
-) -> None:
-    """Decrement the pending counter for one ``release_cost`` call.
-
-    Joins the outer ``backend.transactional()`` block the same way
-    ``_record_committed_spend`` does — see that function's docstring
-    for the rationale. Do NOT introduce a nested ``transactional()``
-    here.
-    """
-    if estimated_cost_usd <= 0:
-        return
-    scopes = (
-        _aggregate_provider_key(provider),
-        _AGGREGATE_ALL_PROVIDERS_SENTINEL,
-    )
-    for scope in scopes:
-        await _upsert_spend_aggregate_row(
-            conn,
-            caller_subsystem=caller_subsystem,
-            provider=scope,
-            pending_delta=-estimated_cost_usd,
-            window_start_ts=_spend_aggregate_window_start(now),
-            now=now,
-        )
+# NOTE: the canonical aggregate-maintenance path is the INLINE
+# ``_upsert_spend_aggregate_row`` calls inside ``reserve_cost``,
+# ``settle_cost``, and ``release_cost`` themselves. They keep the
+# counter update co-located with the source-of-truth write so a
+# reviewer can audit the exact transition (delta sign, scope, sign of
+# the pending-vs-committed swap on settle) at the point it happens.
+# Earlier drafts introduced ``_record_committed_spend`` /
+# ``_record_pending_reservation`` / ``_record_reservation_release``
+# helpers that were never actually called — they confused the data
+# flow without adding value, so they have been removed. If you find
+# yourself reaching for them, that is a smell: the inline calls are
+# the contract.
 
 
 async def effective_spend_usd_aggregate(
