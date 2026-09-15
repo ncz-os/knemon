@@ -94,6 +94,16 @@ class _ReserveBackend:
                     caller_subsystem TEXT PRIMARY KEY,
                     touched_at TEXT NOT NULL
                 );
+                CREATE TABLE knemon_spend_window_aggregates (
+                    caller_subsystem TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT '*',
+                    window_start_ts TEXT NOT NULL,
+                    committed_usd REAL NOT NULL DEFAULT 0 CHECK (committed_usd >= 0),
+                    pending_usd REAL NOT NULL DEFAULT 0 CHECK (pending_usd >= 0),
+                    last_reconciled_at TEXT,
+                    last_updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (caller_subsystem, provider)
+                );
                 CREATE TABLE usage_ledger (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts TEXT NOT NULL,

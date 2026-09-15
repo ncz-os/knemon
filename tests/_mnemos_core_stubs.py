@@ -13,6 +13,15 @@ sibling stub (``mnemos-stubs/mnemos_core/``) which ships no code; the
 runtime stubs are injected at pytest collection time so that the
 collection-import phase succeeds without depending on the full core
 distribution.
+
+When ``mnemos-core`` is already importable (typical for CI / dev
+checkouts where it is installed at ``/Users/jasonperlow/mnemos-core-item7``
+or via the internal index), the stubs below MUST defer to the real
+modules so that callers (and tests) get the real
+``PostgresBackend.record_usage_ledger`` / ``mnemos.api.routes.ledger``
+implementations rather than a stubbed-out placeholder. This module
+guards each ``sys.modules[...]`` registration behind an ``already
+imported?`` check; if the real module is present we leave it alone.
 """
 
 from __future__ import annotations
@@ -34,11 +43,81 @@ _PLAN_WINDOWS: dict[tuple[str, str], tuple[str, int | None]] = {
 }
 
 
+def _already_imported(name: str) -> bool:
+    """Return True if a real ``name`` module is already importable.
+
+    When ``mnemos-core`` is installed at runtime the real subpackage is
+    importable and shadows would clobber it. We probe the path lazily so
+    this module is safe to import even when ``mnemos-core`` is NOT
+    installed (in which case every probe falls back to the stub).
+    """
+    return name in sys.modules or _can_import(name)
+
+
+def _can_import(name: str) -> bool:
+    """Cheap, side-effect-free import probe."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _safe_register(name: str, module: types.ModuleType, parent_pkg: types.ModuleType | None = None) -> bool:
+    """Register a stub ``module`` under ``name`` only if no real one is importable.
+
+    Returns True if the stub was actually registered; False if a real
+    module was found and left alone. Also attaches the stub to the
+    optional ``parent_pkg`` namespace package so ``from
+    parent_pkg.submodule import …`` keeps working for tests that
+    imported the stub parent.
+    """
+    if _already_imported(name):
+        return False
+    sys.modules[name] = module
+    if parent_pkg is not None:
+        setattr(parent_pkg, name.rpartition(".")[-1], module)
+    return True
+
+
 def _install_core_stub() -> None:
-    """Create the `mnemos.core` namespace + minimal submodules."""
-    core_pkg = types.ModuleType("mnemos.core")
-    core_pkg.__path__ = []
-    sys.modules.setdefault("mnemos.core", core_pkg)
+    """Create the `mnemos.core` namespace + minimal submodules.
+
+    Mirrors the ``_install_api_stub`` fix: if the real ``mnemos.core``
+    namespace package is importable (production install), wire the
+    project source path onto it AND leave it alone — pre-registering
+    an empty-``__path__`` stub here would shadow the real namespace
+    package and make every ``mnemos.core.<submodule>`` import return
+    ``None`` or raise ``ModuleNotFoundError`` for real submodules like
+    ``auth_context`` / ``lifecycle`` / ``config``.
+
+    In the stub-only fallback (no real ``mnemos-core`` installed), the
+    legacy empty ``mnemos.core`` package is registered so the stub
+    submodules below can still attach to it.
+    """
+    core_pkg = sys.modules.get("mnemos.core")
+    if core_pkg is None:
+        try:
+            import mnemos.core as core_pkg  # noqa: F401 — namespace pkg
+        except Exception:
+            core_pkg = types.ModuleType("mnemos.core")
+            core_pkg.__path__ = []
+            sys.modules.setdefault("mnemos.core", core_pkg)
+    else:
+        # The real namespace package is loaded. Make sure the project
+        # source path is included so any mnemos/core/*.py the project
+        # itself ships is discoverable (mirrors what an editable
+        # install would do). Today the project ships nothing under
+        # mnemos/core/, but wiring it defensively avoids future
+        # surprises when a sibling repo adds mnemos/core helpers.
+        import os
+
+        project_core = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mnemos", "core")
+        )
+        if project_core not in getattr(core_pkg, "__path__", []) and os.path.isdir(project_core):
+            core_pkg.__path__.append(project_core)
 
     # mnemos.core.config --------------------------------------------------
     class _Settings:
@@ -62,8 +141,7 @@ def _install_core_stub() -> None:
     config_mod.get_settings = _get_settings_callable  # type: ignore[attr-defined]
     config_mod._settings = _settings  # type: ignore[attr-defined]
     config_mod.__all__ = ["get_settings"]
-    sys.modules["mnemos.core.config"] = config_mod
-    setattr(core_pkg, "config", config_mod)
+    _safe_register("mnemos.core.config", config_mod, core_pkg)
 
     # mnemos.core.plan_windows --------------------------------------------
     def _compute_plan_window_id(
@@ -85,8 +163,7 @@ def _install_core_stub() -> None:
         "compute_plan_window_id",
         "plan_path_kind",
     ]
-    sys.modules["mnemos.core.plan_windows"] = plan_windows_mod
-    setattr(core_pkg, "plan_windows", plan_windows_mod)
+    _safe_register("mnemos.core.plan_windows", plan_windows_mod, core_pkg)
 
     # mnemos.core.recommendation ------------------------------------------
     @dataclass
@@ -159,22 +236,46 @@ def _install_core_stub() -> None:
         "recommendation_policy",
         "choose_recommended_model",
     ]
-    sys.modules["mnemos.core.recommendation"] = recommendation_mod
-    setattr(core_pkg, "recommendation", recommendation_mod)
+    _safe_register("mnemos.core.recommendation", recommendation_mod, core_pkg)
 
     # mnemos.core.lifecycle -----------------------------------------------
     lifecycle_mod = types.ModuleType("mnemos.core.lifecycle")
     lifecycle_mod._persistence_backend = None  # type: ignore[attr-defined]
     lifecycle_mod.__all__ = ["_persistence_backend"]
-    sys.modules["mnemos.core.lifecycle"] = lifecycle_mod
-    setattr(core_pkg, "lifecycle", lifecycle_mod)
+    _safe_register("mnemos.core.lifecycle", lifecycle_mod, core_pkg)
 
 
 def _install_persistence_stub() -> None:
-    """Create the `mnemos.persistence` namespace + minimal submodules."""
-    persistence_pkg = types.ModuleType("mnemos.persistence")
-    persistence_pkg.__path__ = []
-    sys.modules.setdefault("mnemos.persistence", persistence_pkg)
+    """Create the `mnemos.persistence` namespace + minimal submodules.
+
+    If the real ``mnemos.persistence`` namespace package is importable
+    (production install), use it as-is and let the project contribute
+    any future ``mnemos/persistence/*.py`` source files via its own
+    ``__path__`` entry. Otherwise fall back to the legacy empty stub
+    so the F04-only ``UsageLedgerRecord`` / ``PostgresBackend`` shims
+    below still have a parent to attach to.
+    """
+    persistence_pkg = sys.modules.get("mnemos.persistence")
+    if persistence_pkg is None:
+        try:
+            import mnemos.persistence as persistence_pkg  # noqa: F401
+        except Exception:
+            persistence_pkg = types.ModuleType("mnemos.persistence")
+            persistence_pkg.__path__ = []
+            sys.modules.setdefault("mnemos.persistence", persistence_pkg)
+    else:
+        # Make sure the project source path is on the namespace
+        # package's __path__ so KNEMON's own mnemos/persistence/*.py
+        # files (none today, but defensively future-proof) are
+        # discoverable when the real mnemos-core namespace package
+        # was imported first.
+        import os
+
+        project_persistence = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mnemos", "persistence")
+        )
+        if project_persistence not in getattr(persistence_pkg, "__path__", []) and os.path.isdir(project_persistence):
+            persistence_pkg.__path__.append(project_persistence)
 
     @dataclass
     class UsageLedgerRecord:
@@ -202,8 +303,7 @@ def _install_persistence_stub() -> None:
     base_mod.UsageLedgerRecord = UsageLedgerRecord  # type: ignore[attr-defined]
     base_mod.UsageLedgerResult = UsageLedgerResult  # type: ignore[attr-defined]
     base_mod.__all__ = ["UsageLedgerRecord", "UsageLedgerResult"]
-    sys.modules["mnemos.persistence.base"] = base_mod
-    setattr(persistence_pkg, "base", base_mod)
+    _safe_register("mnemos.persistence.base", base_mod, persistence_pkg)
 
     # mnemos.persistence.postgres — minimal surface for import-only
     class _PostgresTransaction:
@@ -223,8 +323,7 @@ def _install_persistence_stub() -> None:
     postgres_mod.PostgresBackend = _PostgresBackend  # type: ignore[attr-defined]
     postgres_mod.PostgresTransaction = _PostgresTransaction  # type: ignore[attr-defined]
     postgres_mod.__all__ = ["PostgresBackend", "PostgresTransaction"]
-    sys.modules["mnemos.persistence.postgres"] = postgres_mod
-    setattr(persistence_pkg, "postgres", postgres_mod)
+    _safe_register("mnemos.persistence.postgres", postgres_mod, persistence_pkg)
 
     # mnemos.persistence.schema — minimal statement-splitting helpers
     # used by ``ensure_knemon_schema`` to apply per-dialect SQL
@@ -251,15 +350,56 @@ def _install_persistence_stub() -> None:
         "split_db2_statements",
         "split_oracle_statements",
     ]
-    sys.modules["mnemos.persistence.schema"] = schema_mod
-    setattr(persistence_pkg, "schema", schema_mod)
+    _safe_register("mnemos.persistence.schema", schema_mod, persistence_pkg)
 
 
 def _install_api_stub() -> None:
-    """Create `mnemos.api.*` namespaces + minimal submodules."""
-    api_pkg = types.ModuleType("mnemos.api")
-    api_pkg.__path__ = []
-    sys.modules.setdefault("mnemos.api", api_pkg)
+    """Create `mnemos.api.*` namespaces + minimal submodules.
+
+    When ``mnemos-core`` is importable, the real ``mnemos.api``
+    namespace package exists (the ``mnemos-core`` distribution
+    contributes ``/Users/jasonperlow/mnemos-core-item7/mnemos/api``)
+    AND the project contributes KNEMON's own source files
+    (``mnemos/api/routes/{knemon_*, ledger}.py``). The import system
+    will discover both automatically as long as NEITHER the stub
+    ``mnemos.api`` placeholder nor a stub ``mnemos.api.routes``
+    placeholder has been pre-registered in ``sys.modules``.
+
+    The previous stub version pre-registered empty-``__path__`` modules
+    for both, which silently swallowed the real namespace package and
+    every KNEMON module under it.
+
+    Behaviour summary:
+
+    * If ``mnemos.api`` is importable: do NOT register any stub; let
+      the import system discover the real namespace package and KNEMON
+      submodules naturally on first use.
+    * If ``mnemos.api`` is NOT importable (stub-only fallback): create
+      an empty placeholder so the legacy F04 submodules below can
+      attach.
+    """
+    api_pkg = sys.modules.get("mnemos.api")
+    if api_pkg is not None and getattr(api_pkg, "__path__", None):
+        # Real namespace package already loaded. Make sure the project
+        # source path is wired into its __path__ (an editable install
+        # would do this automatically; explicit here so the stub
+        # works on non-editable internal-index installs too).
+        import os
+
+        project_api = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mnemos", "api")
+        )
+        if project_api not in api_pkg.__path__ and os.path.isdir(project_api):
+            api_pkg.__path__.append(project_api)
+        return  # Real namespace package is fine — nothing to stub.
+
+    # Stub-only fallback path: ``mnemos.api`` either does not exist or
+    # is the legacy empty-stub module. Install a placeholder and let
+    # the F04-era submodules below register against it.
+    if api_pkg is None:
+        api_pkg = types.ModuleType("mnemos.api")
+        api_pkg.__path__ = []
+        sys.modules.setdefault("mnemos.api", api_pkg)
 
     # mnemos.api.dependencies — minimal auth shim
     @dataclass
@@ -281,8 +421,7 @@ def _install_api_stub() -> None:
     dependencies_mod.UserContext = UserContext  # type: ignore[attr-defined]
     dependencies_mod.get_current_user = _get_current_user  # type: ignore[attr-defined]
     dependencies_mod.__all__ = ["UserContext", "get_current_user"]
-    sys.modules["mnemos.api.dependencies"] = dependencies_mod
-    setattr(api_pkg, "dependencies", dependencies_mod)
+    _safe_register("mnemos.api.dependencies", dependencies_mod, api_pkg)
 
     # mnemos.api.extra_guards
     extra_guards_mod = types.ModuleType("mnemos.api.extra_guards")
@@ -290,36 +429,144 @@ def _install_api_stub() -> None:
         return None
     extra_guards_mod.require_extra = _require_extra  # type: ignore[attr-defined]
     extra_guards_mod.__all__ = ["require_extra"]
-    sys.modules["mnemos.api.extra_guards"] = extra_guards_mod
-    setattr(api_pkg, "extra_guards", extra_guards_mod)
+    _safe_register("mnemos.api.extra_guards", extra_guards_mod, api_pkg)
 
     # mnemos.api.routes namespace
-    routes_pkg = types.ModuleType("mnemos.api.routes")
-    routes_pkg.__path__ = []
-    sys.modules["mnemos.api.routes"] = routes_pkg
-    setattr(api_pkg, "routes", routes_pkg)
+    # We deliberately do NOT create a stub ``mnemos.api.routes`` module
+    # here — the project ships real ``mnemos/api/routes/{knemon_*,
+    # ledger}.py`` files that tests need to import (the real
+    # ``_limited_sql`` / ``_timeline_sql`` helpers in
+    # ``knemon_dashboard``, the real ``router`` instance, the real
+    # PostgresBackend etc.). Pre-registering a placeholder here would
+    # shadow them.
+    #
+    # When the real ``mnemos.api.routes`` namespace package exists, we
+    # import it eagerly so that ``from mnemos.api.routes import
+    # knemon_dashboard`` works on the first try (otherwise the implicit
+    # namespace materialisation on first attribute access would happen
+    # at test-collection time, AFTER the parent ``mnemos.api`` stub was
+    # pre-registered with empty ``__path__``, which leaves the routes
+    # namespace without the project source path entry).
+    if not _already_imported("mnemos.api.routes"):
+        # Force the real namespace package to materialise by importing
+        # it. This wires ``api_pkg.__path__`` to include the project
+        # source directory that contains ``knemon_dashboard.py`` etc.
+        try:
+            import mnemos.api.routes as _real_routes  # noqa: F401
 
-    # mnemos.api.routes.{knemon_dashboard, knemon_utilization, knemon_router}
-    for sub in ("knemon_dashboard", "knemon_utilization", "knemon_router"):
-        mod = types.ModuleType(f"mnemos.api.routes.{sub}")
-        mod.router = None  # type: ignore[attr-defined]
-        sys.modules[f"mnemos.api.routes.{sub}"] = mod
-        setattr(routes_pkg, sub, mod)
+            # Replace the empty-stub ``api_pkg`` attribute with the
+            # real namespace package so subsequent ``import
+            # mnemos.api.routes`` finds it AND ``from mnemos.api.routes
+            # import knemon_dashboard`` works.
+            real_routes = sys.modules.get("mnemos.api.routes")
+            if real_routes is not None:
+                # If our stub pre-registered an empty ``__path__``
+                # package under the same name, replace it in the
+                # parent's attribute dict.
+                if real_routes is not api_pkg or real_routes.__path__ != api_pkg.__path__:
+                    setattr(api_pkg, "routes", real_routes)
+        except ImportError:
+            # No real namespace package — fall back to the empty
+            # placeholder so the import machinery still has *some*
+            # module to attach child submodules to.
+            routes_pkg = types.ModuleType("mnemos.api.routes")
+            routes_pkg.__path__ = []
+            sys.modules.setdefault("mnemos.api.routes", routes_pkg)
+            setattr(api_pkg, "routes", routes_pkg)
 
-    # mnemos.api.routes.ledger (FastAPI router stub)
-    ledger_routes_mod = types.ModuleType("mnemos.api.routes.ledger")
 
-    class _Router:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
+def _install_pantheon_stubs() -> None:
+    """Install stub modules for PANTHEON and graeae collaborators.
 
-        def __getattr__(self, name: str) -> Any:
-            return lambda *a, **kw: None
+    PANTHEON (``mnemos.domain.pantheon.*``) and graeae
+    (``mnemos.domain.graeae.*``) are sibling packages in the
+    ``mnemos-os`` distribution. They are NOT installed in this KNEMON
+    checkout — ``pyproject.toml`` declares ``pythonpath = ["../pantheon"]``
+    so a sibling ``pantheon`` checkout (a different repo) is the
+    expected source. When the sibling is absent (dev checkout, CI
+    runner that doesn't have ``../pantheon``) the tests would fail at
+    collection time with ``ModuleNotFoundError``.
 
-    ledger_routes_mod.router = _Router()  # type: ignore[attr-defined]
-    ledger_routes_mod.__all__ = ["router"]
-    sys.modules["mnemos.api.routes.ledger"] = ledger_routes_mod
-    setattr(routes_pkg, "ledger", ledger_routes_mod)
+    The stubs below provide the MINIMAL surface the KNEMON test files
+    actually touch:
+
+    * ``mnemos.domain.pantheon.catalog.list_models`` (async, returns
+      a list) — monkeypatched by ``test_triage_*`` tests.
+    * ``mnemos.domain.pantheon.triage.recommend`` (async) +
+      ``_PRICE_ABSENT_LOGGED`` (bool) — monkeypatched by
+      ``test_triage_*`` tests AND imported by
+      ``test_llm_wrapper_*`` tests that monkeypatch
+      ``triage.recommend``.
+    * ``mnemos.domain.graeae.engine.get_graeae_engine`` (callable
+      returning an object with ``.route()``) — monkeypatched by
+      ``test_llm_wrapper_*`` tests.
+
+    The actual implementations in production come from the sibling
+    ``pantheon`` / ``mnemos-os`` repo, so these stubs are NOT used in
+    production — they exist purely to keep the test-collection phase
+    green when the sibling repo is not available.
+
+    If the real ``mnemos.domain.pantheon`` package IS importable (e.g.
+    via the sibling overlay) the stub defers to it and installs
+    nothing.
+    """
+    if _already_imported("mnemos.domain.pantheon") or _can_import("mnemos.domain.pantheon"):
+        return
+    if _already_imported("mnemos.domain.graeae") or _can_import("mnemos.domain.graeae"):
+        return
+
+    domain_pkg = sys.modules.get("mnemos.domain")
+    if domain_pkg is None:
+        try:
+            import mnemos.domain as domain_pkg  # noqa: F401
+        except Exception:
+            domain_pkg = types.ModuleType("mnemos.domain")
+            domain_pkg.__path__ = []
+            sys.modules.setdefault("mnemos.domain", domain_pkg)
+
+    # mnemos.domain.graeae.engine --------------------------------------
+    graeae_pkg = types.ModuleType("mnemos.domain.graeae")
+    graeae_pkg.__path__ = []
+    _safe_register("mnemos.domain.graeae", graeae_pkg, domain_pkg)
+
+    graeae_engine_mod = types.ModuleType("mnemos.domain.graeae.engine")
+
+    async def _stub_get_graeae_engine():
+        raise RuntimeError(
+            "mnemos.domain.graeae.engine is not available in this checkout; "
+            "tests must monkeypatch get_graeae_engine before calling mnemos.llm.call"
+        )
+
+    graeae_engine_mod.get_graeae_engine = _stub_get_graeae_engine  # type: ignore[attr-defined]
+    graeae_engine_mod.__all__ = ["get_graeae_engine"]
+    _safe_register("mnemos.domain.graeae.engine", graeae_engine_mod, graeae_pkg)
+
+    # mnemos.domain.pantheon -------------------------------------------
+    pantheon_pkg = types.ModuleType("mnemos.domain.pantheon")
+    pantheon_pkg.__path__ = []
+    _safe_register("mnemos.domain.pantheon", pantheon_pkg, domain_pkg)
+
+    catalog_mod = types.ModuleType("mnemos.domain.pantheon.catalog")
+
+    async def _stub_list_models():
+        return []
+
+    catalog_mod.list_models = _stub_list_models  # type: ignore[attr-defined]
+    catalog_mod.__all__ = ["list_models"]
+    _safe_register("mnemos.domain.pantheon.catalog", catalog_mod, pantheon_pkg)
+
+    triage_mod = types.ModuleType("mnemos.domain.pantheon.triage")
+
+    async def _stub_recommend(*args, **kwargs):
+        raise RuntimeError(
+            "mnemos.domain.pantheon.triage.recommend is not available in this "
+            "checkout; tests must monkeypatch triage.recommend before calling it"
+        )
+
+    triage_mod.recommend = _stub_recommend  # type: ignore[attr-defined]
+    triage_mod._PRICE_ABSENT_LOGGED = False  # type: ignore[attr-defined]
+    triage_mod.__all__ = ["recommend", "_PRICE_ABSENT_LOGGED"]
+    _safe_register("mnemos.domain.pantheon.triage", triage_mod, pantheon_pkg)
 
 
 def _install_db_migrations_stub() -> None:
@@ -478,14 +725,163 @@ def _install_db_migrations_stub() -> None:
 
 
 def install_mnemos_core_stubs() -> None:
-    """Install all runtime stubs (idempotent)."""
+    """Install all runtime stubs (idempotent).
+
+    The stub installer guards every ``sys.modules[name]`` registration
+    behind ``_already_imported(name)`` so the stubs below cannot shadow
+    a real ``mnemos-core`` subpackage when one is importable. When the
+    real package IS installed the stubs become no-ops and tests get the
+    real ``PostgresBackend`` / ``mnemos.api.routes.ledger`` / etc.
+
+    We also pre-register the project-source ``mnemos.api.routes.*`` /
+    ``mnemos.domain.knemon.*`` modules in ``sys.modules`` so that the
+    import system does not re-resolve them via the namespace-package
+    path machinery. Namespace packages re-derive their ``__path__`` from
+    the finders every time a child module is imported, which can
+    silently drop the project source path and surface as
+    ``ModuleNotFoundError`` for KNEMON's own route/domain modules.
+    Pre-registering the leaf modules avoids the re-derivation entirely.
+    """
     if getattr(install_mnemos_core_stubs, "_installed", False):
         return
+
+    import os
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    project_mnemos = os.path.abspath(os.path.join(project_root, "mnemos"))
+
+    # Force-import the parent ``mnemos`` namespace package so that
+    # subsequent sub-attribute lookups wire up correctly.
+    try:
+        import mnemos  # noqa: F401
+    except Exception:
+        pass
+
+    # Wire the project source directory onto the ``mnemos`` namespace
+    # package's ``__path__`` so KNEMON's own mnemos/{domain/knemon,
+    # api/routes/knemon_*, etc.} files are discoverable. In an editable
+    # install of mnemos-knemon, setuptools usually wires this
+    # automatically, but on internal-index installs where the project
+    # is installed as a regular site-packages package, the namespace
+    # contribution needs an explicit hint.
+    if os.path.isdir(project_mnemos):
+        mnemos_root = sys.modules.get("mnemos")
+        if mnemos_root is not None:
+            mnemos_paths = getattr(mnemos_root, "__path__", [])
+            if project_mnemos not in mnemos_paths:
+                mnemos_paths.append(project_mnemos)
+
+    # Wire the local ``mnemos-core`` checkout (if any) onto the
+    # ``mnemos`` namespace package's ``__path__`` so the real
+    # ``mnemos.api.dependencies`` / ``mnemos.persistence.postgres`` /
+    # ``mnemos.llm`` modules are importable. Production nodes install
+    # ``mnemos-core`` from an internal index that ships with full
+    # sources; the venv in this checkout resolves the dep against the
+    # local ``mnemos-stubs/mnemos_core`` placeholder which has no code,
+    # so tests would otherwise have to rely on the in-memory stub
+    # shims below. Auto-detecting a sibling checkout via
+    # ``MNEMOS_CORE_PATH`` env var OR a well-known ``../`` location
+    # makes the validation work either way without forcing the
+    # developer to edit uv config.
+    mnemos_core_path = os.environ.get("MNEMOS_CORE_PATH", "").strip()
+    if not mnemos_core_path:
+        candidates = [
+            os.path.abspath(os.path.join(project_root, "..", "mnemos-core-item7", "mnemos")),
+            os.path.abspath(os.path.join(project_root, "..", "mnemos-core", "mnemos")),
+        ]
+        for candidate in candidates:
+            if os.path.isdir(candidate) and os.path.isfile(
+                os.path.join(candidate, "api", "dependencies.py")
+            ):
+                mnemos_core_path = candidate
+                break
+    if mnemos_core_path and os.path.isdir(mnemos_core_path):
+        mnemos_root = sys.modules.get("mnemos")
+        if mnemos_root is not None:
+            mnemos_paths = getattr(mnemos_root, "__path__", [])
+            if mnemos_core_path not in mnemos_paths:
+                mnemos_paths.append(mnemos_core_path)
+
+    # Pre-register KNEMON's own source modules in ``sys.modules``
+    # BEFORE any other code (including conftest, pytest, or the
+    # individual tests) has a chance to import them through the
+    # namespace-package path machinery. Once a module is in
+    # ``sys.modules`` by its dotted name, the import system returns it
+    # directly without re-resolving any parent namespace package.
+    _register_knemon_modules(project_mnemos)
+
     _install_core_stub()
     _install_persistence_stub()
     _install_api_stub()
+    _install_pantheon_stubs()
     _install_db_migrations_stub()
     install_mnemos_core_stubs._installed = True  # type: ignore[attr-defined]
+
+
+def _register_knemon_modules(project_mnemos: str) -> None:
+    """Pre-register KNEMON's own Python modules under their dotted names.
+
+    The project contributes ``mnemos.domain.knemon.*`` and
+    ``mnemos.api.routes.{knemon_*, ledger}.py`` as namespace-package
+    members. Python's namespace-package machinery re-derives the
+    parent ``__path__`` from the finders every time a child module is
+    imported, which can drop the project source path silently — and
+    surface as ``ModuleNotFoundError`` for KNEMON's own modules when
+    the mnemos-core namespace package's finders do not include our
+    checkout.
+
+    By eagerly importing each KNEMON Python file under its dotted name
+    into ``sys.modules`` we sidestep the re-derivation entirely. This
+    is safe even when the modules would be importable through the
+    regular path machinery (the regular import is just a no-op once
+    the module is cached in ``sys.modules``).
+    """
+    import importlib.util
+    import os
+
+    routes_dir = os.path.join(project_mnemos, "api", "routes")
+    domain_knemon_dir = os.path.join(project_mnemos, "domain", "knemon")
+
+    for directory, parent in (
+        (routes_dir, "mnemos.api.routes"),
+        (domain_knemon_dir, "mnemos.domain.knemon"),
+    ):
+        if not os.path.isdir(directory):
+            continue
+        # Make sure the parent namespace package is in sys.modules
+        # first so the import system has something to attach the
+        # children to.
+        try:
+            importlib.import_module(parent)
+        except Exception:
+            pass
+
+        for entry in sorted(os.listdir(directory)):
+            if not entry.endswith(".py") or entry == "__init__.py":
+                continue
+            if entry.startswith("_") and entry not in {"_plan_windows.py"}:
+                continue
+            module_name = f"{parent}.{entry[:-3]}"
+            if module_name in sys.modules:
+                continue
+            file_path = os.path.join(directory, entry)
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, file_path)
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+                # Also attach to the parent so attribute lookup works.
+                parent_mod = sys.modules.get(parent)
+                if parent_mod is not None:
+                    setattr(parent_mod, entry[:-3], module)
+            except Exception:
+                # If a particular module fails to import (e.g. it has
+                # its own missing dependency), leave it out of
+                # sys.modules so a later import attempt can surface the
+                # real error.
+                sys.modules.pop(module_name, None)
 
 
 __all__ = ["install_mnemos_core_stubs"]

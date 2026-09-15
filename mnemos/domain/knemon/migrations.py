@@ -16,6 +16,7 @@ MIGRATION_NAMES = (
     "0052_knemon_burn_reservations.sql",
     "0053_knemon_ledger_principals.sql",
     "0054_knemon_cost_reservations.sql",
+    "0055_knemon_spend_aggregates.sql",
 )
 # Backward-compatible name retained for integrations that imported it.
 MIGRATION_NAME = MIGRATION_NAMES[0]
@@ -39,6 +40,10 @@ async def _schema_present(backend: Any) -> bool:
             await _tx_rows(
                 _conn_from_tx(tx),
                 "SELECT attempt_id FROM knemon_cost_reservations WHERE 1 = 0",
+            )
+            await _tx_rows(
+                _conn_from_tx(tx),
+                "SELECT caller_subsystem FROM knemon_spend_window_aggregates WHERE 1 = 0",
             )
         return True
     except Exception as exc:
