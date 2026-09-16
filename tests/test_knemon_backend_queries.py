@@ -208,3 +208,48 @@ def test_sqlite_dashboard_queries_bound_and_aggregate_populated_ledger():
     assert sum(row[-2] for row in timeline_rows) == 1000
     assert len(daily_rows) <= 2
     assert sum(row[-2] for row in daily_rows) == 1000
+
+
+@pytest.mark.parametrize("dialect", ["postgres", "sqlite", "mysql", "oracle", "db2"])
+def test_model_registry_predicate_matches_each_backend_boolean_shape(dialect):
+    """Regression: the recommendations route 500'd on PostgreSQL.
+
+    ``model_registry.available`` / ``.deprecated`` are BOOLEAN on Postgres but
+    integer-family columns elsewhere (INTEGER on SQLite, NUMBER(1) on Oracle,
+    SMALLINT on Db2). Postgres has no implicit boolean-to-integer cast, so the
+    previously hardcoded ``available = 1 AND COALESCE(deprecated, 0) = 0``
+    raised ``operator does not exist: boolean = integer`` there.
+    """
+    predicate = knemon_dashboard._model_registry_live_predicate(dialect)
+    assert "available" in predicate
+    assert "deprecated" in predicate
+    if dialect == "postgres":
+        assert "= 1" not in predicate
+        assert "COALESCE(deprecated, 0)" not in predicate
+        assert predicate == "available = TRUE AND deprecated IS NOT TRUE"
+    else:
+        assert predicate == "available = 1 AND COALESCE(deprecated, 0) = 0"
+
+
+def test_model_registry_predicate_filters_live_rows_on_sqlite_integer_columns():
+    """Execute the non-Postgres branch for real, both directions."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE model_registry (provider TEXT, model_id TEXT, "
+        "available INTEGER NOT NULL DEFAULT 1, "
+        "deprecated INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.executemany(
+        "INSERT INTO model_registry VALUES (?, ?, ?, ?)",
+        [
+            ("live", "m-live", 1, 0),
+            ("unavailable", "m-gone", 0, 0),
+            ("deprecated", "m-old", 1, 1),
+        ],
+    )
+    predicate = knemon_dashboard._model_registry_live_predicate("sqlite")
+    rows = conn.execute(
+        f"SELECT provider FROM model_registry WHERE {predicate}"
+    ).fetchall()
+    conn.close()
+    assert [row[0] for row in rows] == ["live"]

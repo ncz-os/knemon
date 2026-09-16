@@ -126,6 +126,24 @@ def _limited_sql(sql: str, dialect: str, limit: int) -> str:
     return f"{sql.rstrip()}\n{clause}"
 
 
+def _model_registry_live_predicate(dialect: str) -> str:
+    """Filter model_registry to live rows using the dialect's boolean shape.
+
+    ``available`` / ``deprecated`` are declared BOOLEAN on Postgres but as
+    integer-family columns (INTEGER on SQLite, NUMBER(1) on Oracle, SMALLINT
+    on Db2). Postgres has no implicit boolean-to-integer cast, so the integer
+    form raises ``operator does not exist: boolean = integer`` and turned this
+    route into an HTTP 500 there while working on every other backend.
+
+    A single portable form does not exist: a bare ``WHERE available`` predicate
+    is valid on Postgres but rejected by Oracle NUMBER(1) and Db2 SMALLINT, so
+    the dialect branch is required.
+    """
+    if dialect == "postgres":
+        return "available = TRUE AND deprecated IS NOT TRUE"
+    return "available = 1 AND COALESCE(deprecated, 0) = 0"
+
+
 def _timeline_sql(dialect: str, bucket: str) -> str:
     """Aggregate the bounded seven-day range into calendar buckets in SQL."""
     if dialect == "sqlite":
@@ -416,13 +434,13 @@ async def recommendations(task_type: str | None = None, _: UserContext = Depends
         except Exception as exc:
             recommend_error = str(exc)
 
-        registry_rows = await _rows(
-            """
+        registry_rows = await _dialect_rows(
+            lambda dialect: f"""
             SELECT provider, model_id, display_name, input_cost_per_mtok,
                    output_cost_per_mtok, capabilities, arena_score, arena_rank,
                    graeae_weight, context_window
             FROM model_registry
-            WHERE available = 1 AND COALESCE(deprecated, 0) = 0
+            WHERE {_model_registry_live_predicate(dialect)}
             """
         )
         candidates = []
