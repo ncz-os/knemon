@@ -251,6 +251,28 @@ def _qmark_sql(sql: str, params: dict[str, Any]) -> tuple[str, list[Any]]:
     return _NAMED_PARAM_RE.sub(replace, sql), values
 
 
+def _named_params(sql: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Restrict ``params`` to the binds ``sql`` actually references.
+
+    The PostgreSQL, MySQL and Db2 rewriters above already do this implicitly:
+    they build their argument list by walking the SQL text, so a supplied bind
+    the statement never mentions is silently unused. SQLite's driver ignores
+    extra keys too. python-oracledb does not -- it raises
+    ``DPY-4008: no bind placeholder named ":x" was found in the SQL text`` --
+    which made Oracle the single backend where a shared bind dict is fatal.
+    Filtering here gives the named-bind path the same tolerance as the other
+    four dialects.
+
+    This can only ever DROP a name absent from the SQL text; a bind the
+    statement does reference is always kept, so a genuine name mismatch still
+    surfaces loudly as a missing-bind error rather than being masked.
+    """
+    if not params:
+        return {}
+    present = {match.group(1) for match in _NAMED_PARAM_RE.finditer(sql)}
+    return {name: value for name, value in params.items() if name in present}
+
+
 def _is_mysql_connection(conn: Any) -> bool:
     identity = f"{type(conn).__module__}.{type(conn).__name__}".lower()
     return any(
@@ -288,7 +310,7 @@ async def _rows(
                 mysql_sql, mysql_params = _mysql_sql(sql, params or {})
                 await _call(cursor.execute, mysql_sql, tuple(mysql_params))
             else:
-                await _call(cursor.execute, sql, params or {})
+                await _call(cursor.execute, sql, _named_params(sql, params or {}))
             fetched = await _call(cursor.fetchall)
             description = getattr(cursor, "description", None) or []
             names = [str(col[0]).lower() for col in description]
@@ -360,7 +382,7 @@ async def _tx_execute(conn: Any, sql: str, params: dict[str, Any] | None = None)
             db2_sql, db2_params = _qmark_sql(sql, values)
             await _call(cursor.execute, db2_sql, tuple(db2_params))
         else:
-            await _call(cursor.execute, sql, values)
+            await _call(cursor.execute, sql, _named_params(sql, values))
         return getattr(cursor, "rowcount", None)
     finally:
         close = getattr(cursor, "close", None)
@@ -388,7 +410,7 @@ async def _tx_rows(
             db2_sql, db2_params = _qmark_sql(sql, values)
             await _call(cursor.execute, db2_sql, tuple(db2_params))
         else:
-            await _call(cursor.execute, sql, values)
+            await _call(cursor.execute, sql, _named_params(sql, values))
         fetched = await _call(cursor.fetchall)
         description = getattr(cursor, "description", None) or []
         names = [str(col[0]).lower() for col in description]

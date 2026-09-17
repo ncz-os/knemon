@@ -855,7 +855,7 @@ async def _spend_components_tx(
     now: datetime,
     since: datetime,
 ) -> tuple[float, float]:
-    params = {"caller_subsystem": caller_subsystem, "since_ts": since, "now_ts": now}
+    provider_params: dict[str, Any] = {}
     clause = ""
     if provider and provider != "*":
         canonical = _canon_provider(provider)
@@ -864,16 +864,32 @@ async def _spend_components_tx(
         )
         binds = []
         for i, name in enumerate(names):
-            params[f"provider_{i}"] = name
+            provider_params[f"provider_{i}"] = name
             binds.append(f":provider_{i}")
         clause = "AND LOWER(provider) IN (" + ", ".join(binds) + ")"
+    # Each statement gets exactly the binds its own SQL text references. The
+    # three queries below do NOT share a bind set: only the first two are
+    # window-scoped (:since_ts), and none of them reference the caller's
+    # ``now``. Oracle rejects a supplied bind the statement does not contain
+    # (DPY-4008) where every other supported driver ignores it, so a shared
+    # dict fails on Oracle alone -- and because the budget gate fails closed,
+    # that denied every GRAEAE consultation including free providers.
+    windowed_params: dict[str, Any] = {
+        "caller_subsystem": caller_subsystem,
+        "since_ts": since,
+        **provider_params,
+    }
+    pending_params: dict[str, Any] = {
+        "caller_subsystem": caller_subsystem,
+        **provider_params,
+    }
     ledger = await _tx_rows(
         conn,
         f"""
         SELECT COALESCE(SUM(est_cost_usd), 0) AS amount FROM usage_ledger
         WHERE caller_subsystem = :caller_subsystem AND {_time_sql(conn, "ts")} >= {_time_sql(conn, ":since_ts")} {clause}
         """,
-        params,
+        windowed_params,
     )
     settled = await _tx_rows(
         conn,
@@ -883,7 +899,7 @@ async def _spend_components_tx(
           AND {_time_sql(conn, "settled_at")} >= {_time_sql(conn, ":since_ts")}
           AND (ledger_id IS NULL OR NOT EXISTS (SELECT 1 FROM usage_ledger l WHERE l.id = r.ledger_id)) {clause}
         """,
-        params,
+        windowed_params,
     )
     pending = await _tx_rows(
         conn,
@@ -891,7 +907,7 @@ async def _spend_components_tx(
         SELECT COALESCE(SUM(estimated_cost_usd), 0) AS amount FROM knemon_cost_reservations
         WHERE status = 'pending' AND caller_subsystem = :caller_subsystem {clause}
         """,
-        params,
+        pending_params,
     )
     # Expiry is not proof an upstream request was free. Recovery settles conservatively.
     return float(ledger[0]["amount"]) + float(settled[0]["amount"]), float(
@@ -1069,18 +1085,20 @@ async def cleanup_cost_reservations(
                 {"scope": scope["caller_subsystem"], "now_ts": current},
             )
             for expired_row in expired:
-                params = {"id": expired_row["attempt_id"], "now_ts": current}
+                # Same rule as _spend_components_tx: per-statement binds. The
+                # INSERT references only :id, so handing it :now_ts as well is
+                # a DPY-4008 on Oracle.
                 await _tx_execute(
                     conn,
                     "INSERT INTO knemon_cost_recovery(attempt_id) VALUES (:id)",
-                    params,
+                    {"id": expired_row["attempt_id"]},
                 )
                 await _tx_execute(
                     conn,
                     """UPDATE knemon_cost_reservations
                     SET status = 'settled', settled_at = :now_ts, actual_cost_usd = estimated_cost_usd
                     WHERE attempt_id = :id""",
-                    params,
+                    {"id": expired_row["attempt_id"], "now_ts": current},
                 )
             await _tx_execute(
                 conn,
