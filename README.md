@@ -25,7 +25,7 @@ onto `mnemos-core`.
 pip install mnemos-core mnemos-knemon
 ```
 
-KNEMON is bundled in the Mnemos umbrella image (`ghcr.io/ncz-os/mnemos`) and the
+KNEMON is bundled in the Mnemos umbrella image (`ghcr.io/ncz-os/mnemos-enterprise`) and the
 `server`/`full` bundles, and is separable for minimal core installs. When the
 distribution is present, `mnemos-core` mounts the KNEMON routes automatically;
 when absent, core boots without them.
@@ -60,6 +60,30 @@ single-worker deployments can temporarily opt into the legacy non-atomic
 behavior with `MNEMOS_KNEMON_ALLOW_NONATOMIC_BURN_DEVELOPMENT=true`; this
 setting is not safe for production or multiple workers.
 
+
+## Backend coverage
+
+KNEMON's ledger, budget engine and reservation accounting run through core's
+persistence ABC on every backend, with per-dialect SQL where a portable form
+does not exist.
+
+`GET /v1/knemon/recommendations` returned **HTTP 500 on PostgreSQL** while
+working on the other five backends: the `model_registry` lookup in
+`knemon_dashboard.py` hardcoded an integer-family predicate
+(`WHERE available = 1 AND COALESCE(deprecated, 0) = 0`), and core declares those
+columns `BOOLEAN` on PostgreSQL but `INTEGER` on SQLite, `NUMBER(1)` on Oracle
+and `SMALLINT` on Db2. PostgreSQL has no implicit boolean-to-integer cast, so
+the query raised `operator does not exist: boolean = integer`. Fixed by routing
+the predicate through the existing `_dialect_rows()` per-dialect helper pattern;
+only the PostgreSQL branch changed. A single portable form does not exist — a
+bare `WHERE available` is valid on PostgreSQL but rejected by Oracle
+`NUMBER(1)` and Db2 `SMALLINT` — so the dialect branch is required.
+
+It survived review because the query had **zero test coverage on any backend**;
+the only live-PostgreSQL test creates `usage_ledger` and never `model_registry`,
+so CI's postgres service never reached it. The predicate shape is now asserted
+for all five dialects, and the non-PostgreSQL branch is executed for real
+against a SQLite `model_registry`.
 
 ## Build infrastructure & partners
 
