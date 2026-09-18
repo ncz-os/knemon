@@ -13,16 +13,17 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import HTMLResponse
-
 from mnemos.api.dependencies import UserContext, require_root
 from mnemos.api.extra_guards import require_extra
 from mnemos.api.persistence_helpers import backend_or_503
+
 from mnemos.domain.knemon.router import (
     _asyncpg_sql,
     _connection_dialect,
     _dict_rows,
     _is_mysql_connection,
     _mysql_sql,
+    _named_params,
     _qmark_sql,
 )
 
@@ -88,7 +89,7 @@ async def _connection_rows(
             db2_sql, db2_params = _qmark_sql(sql, values)
             await _call(cursor.execute, db2_sql, tuple(db2_params))
         else:
-            await _call(cursor.execute, sql, values)
+            await _call(cursor.execute, sql, _named_params(sql, values))
         fetched = await _call(cursor.fetchall)
         names = [col[0].lower() for col in cursor.description]
         out: list[dict[str, Any]] = []

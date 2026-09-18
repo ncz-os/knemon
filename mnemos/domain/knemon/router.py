@@ -194,21 +194,6 @@ def _conn_from_tx(tx: Any) -> Any:
     return getattr(tx, "conn", tx)
 
 
-def _row_get(row: Any, key: str, default: Any = None) -> Any:
-    if isinstance(row, dict):
-        return row.get(key, default)
-    try:
-        return row[key]
-    except Exception:
-        pass
-    lower = key.lower()
-    try:
-        return row[lower]
-    except Exception:
-        pass
-    return getattr(row, key, getattr(row, lower, default))
-
-
 def _asyncpg_sql(sql: str, params: dict[str, Any]) -> tuple[str, list[Any]]:
     values: list[Any] = []
     positions: dict[str, int] = {}
@@ -933,14 +918,6 @@ def _subscription_pool_aliases(plan: dict[str, Any]) -> set[str]:
         if "codex" in plan_name:
             aliases.add("codex_subscription")
     return aliases
-
-
-def _plan_family_alias(plan: dict[str, Any]) -> str | None:
-    aliases = _subscription_pool_aliases(plan)
-    for family in ("chatgpt_subscription", "codex_subscription", "claude_subscription"):
-        if family in aliases:
-            return family
-    return None
 
 
 def _candidate_plan_family(candidate: dict[str, Any] | None) -> str | None:

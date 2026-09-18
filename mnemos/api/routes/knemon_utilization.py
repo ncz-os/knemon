@@ -8,17 +8,18 @@ from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-
 from mnemos.api.dependencies import UserContext, require_root
 from mnemos.api.extra_guards import require_extra
 from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.core.plan_windows import compute_plan_window_id
+
 from mnemos.domain.knemon.router import (
     _asyncpg_sql,
     _connection_dialect,
     _dict_rows,
     _is_mysql_connection,
     _mysql_sql,
+    _named_params,
     _qmark_sql,
 )
 
@@ -64,7 +65,7 @@ async def _rows(sql: str, params: dict[str, Any] | None = None) -> list[dict[str
                 db2_sql, db2_params = _qmark_sql(sql, params or {})
                 await _call(cursor.execute, db2_sql, tuple(db2_params))
             else:
-                await _call(cursor.execute, sql, params or {})
+                await _call(cursor.execute, sql, _named_params(sql, params or {}))
             fetched = await _call(cursor.fetchall)
             names = [col[0].lower() for col in cursor.description]
             return [{name: _jsonable(value) for name, value in zip(names, row)} for row in fetched or []]
