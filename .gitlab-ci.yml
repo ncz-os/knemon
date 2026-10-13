@@ -30,7 +30,7 @@ pytest:
   before_script:
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends git build-essential cmake
     - git clone https://gitlab.com/ncz-os/mnemos.git ../mnemos-core
-    - git -C ../mnemos-core checkout 0ea31e2ec9a0d3418af764d245c31377f5fafdb0
+    - git -C ../mnemos-core checkout 7aa4d225a05be34d434c66ca675601ce0e6d6fc2
     - git clone https://gitlab.com/ncz-os/graeae.git ../graeae
     - git -C ../graeae checkout df5ea98afdbb5da62f65f8dc8f0cb2b0b516e1c7
     - git clone https://gitlab.com/ncz-os/pantheon.git ../pantheon
