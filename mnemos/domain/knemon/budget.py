@@ -957,6 +957,38 @@ async def _refresh_attempt_scopes(conn: Any, row: dict, now: datetime) -> None:
         )
 
 
+async def _shift_attempt_scopes(
+    conn: Any,
+    row: dict,
+    now: datetime,
+    *,
+    committed_delta: float,
+    pending_delta: float,
+) -> None:
+    """Move one attempt between the pending and committed reporting counters.
+
+    The aggregate rows are a reporting snapshot: admission never reads them
+    (it sums the ledger under the caller-subsystem lock). For the common
+    pending -> settled/released transition the exact change is known, so apply
+    it as a delta instead of re-summing the whole rolling window. A full
+    rebuild here costs six window scans per finished attempt while the
+    caller-subsystem lock is held, which serialises every concurrent
+    reservation and settlement behind it. The periodic cleanup still
+    reconciles absolute values (window expiry, recovery corrections).
+    """
+    window_start = _spend_aggregate_window_start(now)
+    for provider in (row["provider"], _AGGREGATE_ALL_PROVIDERS_SENTINEL):
+        await _upsert_spend_aggregate_row(
+            conn,
+            caller_subsystem=row["caller_subsystem"],
+            provider=provider,
+            committed_delta=committed_delta,
+            pending_delta=pending_delta,
+            window_start_ts=window_start,
+            now=now,
+        )
+
+
 async def settle_cost(
     backend: Any,
     *,
@@ -1031,7 +1063,16 @@ async def settle_cost_in_transaction(
         "DELETE FROM knemon_cost_recovery WHERE attempt_id = :id",
         {"id": attempt_id},
     )
-    await _refresh_attempt_scopes(conn, row, current)
+    if row["status"] == "pending" and not recovery:
+        await _shift_attempt_scopes(
+            conn,
+            row,
+            current,
+            committed_delta=amount,
+            pending_delta=-_to_float(row.get("estimated_cost_usd"), 0.0),
+        )
+    else:
+        await _refresh_attempt_scopes(conn, row, current)
 
 
 async def release_cost(
@@ -1049,7 +1090,13 @@ async def release_cost(
             "UPDATE knemon_cost_reservations SET status = 'released', released_at = :now_ts WHERE attempt_id = :id",
             {"now_ts": current, "id": attempt_id},
         )
-        await _refresh_attempt_scopes(conn, row, current)
+        await _shift_attempt_scopes(
+            conn,
+            row,
+            current,
+            committed_delta=0.0,
+            pending_delta=-_to_float(row.get("estimated_cost_usd"), 0.0),
+        )
 
 
 async def cleanup_cost_reservations(

@@ -890,3 +890,66 @@ async def test_provider_scoped_aggregate_matches_provider_filter(backend):
     assert openai_agg == pytest.approx(openai_fresh)
     assert anthropic_agg == pytest.approx(5.0)
     assert anthropic_agg == pytest.approx(anthropic_fresh)
+
+
+def _raw_aggregate(backend: Any, caller: str, provider: str) -> tuple[float, float]:
+    with backend._lock:
+        cur = backend._conn.cursor()
+        try:
+            cur.execute(
+                "SELECT committed_usd, pending_usd FROM knemon_spend_window_aggregates "
+                "WHERE caller_subsystem = ? AND provider = ?",
+                (caller, provider),
+            )
+            row = cur.fetchone()
+        finally:
+            cur.close()
+    return (float(row[0]), float(row[1])) if row else (0.0, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_settle_and_release_do_not_rescan_window_under_lock(backend, monkeypatch):
+    """Finishing a pending attempt shifts the counters without a window rebuild.
+
+    settle/release run while the caller-subsystem lock is held, so every
+    concurrent reservation for that subsystem waits behind them. A full
+    rolling-window reconcile there (six SUM scans per finished attempt)
+    turns the lock into a throughput ceiling that shrinks as the ledger
+    grows. The pending -> settled/released change is known exactly, so the
+    reporting counters must move by delta and still match a fresh SUM.
+    """
+    now = datetime.now(tz=timezone.utc)  # noqa: UP017 - file convention
+    caller = "pantheon"
+    for attempt in ("finish-settle", "finish-release"):
+        await reserve_cost(
+            backend,
+            provider="openai",
+            model="gpt-4o",
+            estimated_cost_usd=1.0,
+            attempt_id=attempt,
+            caller_subsystem=caller,
+            now=now,
+        )
+
+    rebuilds: list[Any] = []
+    original = B._reconcile_spend_aggregates_tx
+
+    async def counting(*args: Any, **kwargs: Any) -> None:
+        rebuilds.append(kwargs.get("provider"))
+        await original(*args, **kwargs)
+
+    monkeypatch.setattr(B, "_reconcile_spend_aggregates_tx", counting)
+    await settle_cost(
+        backend, attempt_id="finish-settle", actual_cost_usd=0.25, now=now
+    )
+    await release_cost(backend, attempt_id="finish-release", now=now)
+    assert rebuilds == []
+
+    fresh = await _fresh_spend_usd(
+        backend, caller_subsystem=caller, provider=None, now=now
+    )
+    for provider in ("openai", "*"):
+        committed, pending = _raw_aggregate(backend, caller, provider)
+        assert committed == pytest.approx(0.25)
+        assert pending == pytest.approx(0.0)
+        assert committed + pending == pytest.approx(fresh)
